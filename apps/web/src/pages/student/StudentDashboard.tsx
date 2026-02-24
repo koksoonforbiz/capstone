@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../../contexts/AuthContext';
+import { usePageContext } from '../../contexts/PageContext';
 import { apiFetch } from '../../lib/api';
 
 interface Enrollment {
@@ -38,6 +39,7 @@ interface Assessment {
 export function StudentDashboard() {
   const { user } = useAuth();
   const navigate = useNavigate();
+  const { setPageContext } = usePageContext();
   const [enrollments, setEnrollments] = useState<Enrollment[]>([]);
   const [masteryData, setMasteryData] = useState<MasteryByTopic[]>([]);
   const [loading, setLoading] = useState(true);
@@ -45,10 +47,20 @@ export function StudentDashboard() {
   const [generatingWorksheet, setGeneratingWorksheet] = useState(false);
   const [worksheetError, setWorksheetError] = useState<string | null>(null);
 
+  // Set page context for dashboard
+  useEffect(() => {
+    setPageContext({
+      pageType: 'dashboard',
+      courseId: null,
+      contentId: null,
+      contentTitle: 'Dashboard',
+    });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
   useEffect(() => {
     const fetchData = async () => {
       try {
-        const data = await apiFetch<Enrollment[]>('/api/enrollments/my');
+        const data = await apiFetch<Enrollment[]>('/enrollments/my');
         setEnrollments(data);
       } catch {
         // Silently fail for dashboard
@@ -59,7 +71,7 @@ export function StudentDashboard() {
 
     const fetchMastery = async () => {
       try {
-        const data = await apiFetch<MasteryByTopic[]>('/api/me/mastery');
+        const data = await apiFetch<MasteryByTopic[]>('/me/mastery');
         setMasteryData(data);
       } catch {
         // Silently fail
@@ -76,7 +88,7 @@ export function StudentDashboard() {
     setGeneratingWorksheet(true);
     setWorksheetError(null);
     try {
-      const assessment = await apiFetch<Assessment>('/api/me/revise-worksheet', {
+      const assessment = await apiFetch<Assessment>('/me/revise-worksheet', {
         method: 'POST',
       });
       void assessment;

@@ -13,6 +13,17 @@ import { AssessmentsModule } from './assessments';
 import { EnrollmentsModule } from './enrollments';
 import { AttemptsModule } from './attempts';
 import { MasteryModule } from './mastery';
+import { CourseModulesModule } from './modules';
+import { RagModule } from './rag';
+import { CourseStructureModule } from './course-structure';
+import { PageContentModule } from './page-content';
+import { EvaluationModule } from './evaluation';
+import { KcModule } from './kc';
+import { KcEvaluationModule } from './kc-evaluation';
+import { CurriculumCoverageModule } from './curriculum-coverage';
+import { KnowledgeVersionModule } from './knowledge-version';
+import { PublishGateModule } from './publish-gate';
+import { LearningInterventionsModule } from './learning-interventions';
 import { HealthController } from './health.controller';
 import { ThrottlerRedisStorage } from './common/throttle-redis.storage';
 
@@ -37,6 +48,17 @@ import { ThrottlerRedisStorage } from './common/throttle-redis.storage';
     EnrollmentsModule,
     AttemptsModule,
     MasteryModule,
+    CourseModulesModule,
+    RagModule,
+    CourseStructureModule,
+    PageContentModule,
+    EvaluationModule,
+    KcModule,
+    KcEvaluationModule,
+    CurriculumCoverageModule,
+    KnowledgeVersionModule,
+    PublishGateModule,
+    LearningInterventionsModule,
   ],
   controllers: [HealthController],
 })

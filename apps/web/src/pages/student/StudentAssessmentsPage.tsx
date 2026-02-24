@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiFetch } from '../../lib/api';
+import { usePageContext } from '../../contexts/PageContext';
 
 interface AssessmentQuestion {
   id: string;
@@ -12,6 +13,7 @@ interface Assessment {
   title: string;
   description: string | null;
   courseId: string;
+  mode?: string;
   course: {
     id: string;
     title: string;
@@ -27,18 +29,29 @@ interface Attempt {
 
 export function StudentAssessmentsPage() {
   const navigate = useNavigate();
+  const { setPageContext } = usePageContext();
   const [assessments, setAssessments] = useState<Assessment[]>([]);
   const [attempts, setAttempts] = useState<Attempt[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [starting, setStarting] = useState<string | null>(null);
 
+  // Set page context for assessments page
+  useEffect(() => {
+    setPageContext({
+      pageType: 'assessments',
+      courseId: null,
+      contentId: null,
+      contentTitle: 'Assessments',
+    });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
   useEffect(() => {
     const fetchData = async () => {
       try {
         const [assessmentsData, attemptsData] = await Promise.all([
-          apiFetch<Assessment[]>('/api/assessments/available'),
-          apiFetch<Attempt[]>('/api/attempts/my'),
+          apiFetch<Assessment[]>('/assessments/available'),
+          apiFetch<Attempt[]>('/attempts/my'),
         ]);
         setAssessments(assessmentsData);
         setAttempts(attemptsData);
@@ -66,7 +79,7 @@ export function StudentAssessmentsPage() {
     setError(null);
 
     try {
-      const attempt = await apiFetch<Attempt>('/api/attempts', {
+      const attempt = await apiFetch<Attempt>('/attempts', {
         method: 'POST',
         body: JSON.stringify({
           assessmentId: assessment.id,
@@ -110,6 +123,13 @@ export function StudentAssessmentsPage() {
                   <div>
                     <div className="flex items-center gap-2">
                       <h3 className="text-lg font-semibold text-gray-900">{assessment.title}</h3>
+                      {assessment.mode && (
+                        <span className={`text-xs px-2 py-1 rounded-full font-medium ${
+                          assessment.mode === 'test' ? 'bg-red-100 text-red-800' : 'bg-blue-100 text-blue-800'
+                        }`}>
+                          {assessment.mode}
+                        </span>
+                      )}
                       {isCompleted && (
                         <span className="text-xs px-2 py-1 rounded-full font-medium bg-green-100 text-green-800">
                           Completed

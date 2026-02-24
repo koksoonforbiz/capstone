@@ -19,6 +19,9 @@ enum QuestionType {
   text
   drawing
   mixed
+  MCQ_SINGLE
+  MCQ_MULTI
+  STRUCTURED
 }
 
 enum AttemptStatus {
@@ -40,6 +43,47 @@ enum EventStatus {
   failed
 }
 
+enum CourseStatus {
+  DRAFT
+  PUBLISHED
+}
+
+enum CourseVisibility {
+  PUBLIC
+  PRIVATE
+}
+
+enum ModuleItemType {
+  PAGE
+  PDF
+  LINK
+  ASSESSMENT
+}
+
+enum EnrollmentStatus {
+  ACTIVE
+  DROPPED
+}
+
+enum DraftStatus {
+  DRAFT
+  APPROVED
+  REJECTED
+}
+
+enum ChunkingStrategy {
+  FIXED_SIZE
+  PARAGRAPH
+  SEMANTIC
+}
+
+enum GenerationJobStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
 // ─── Models ──────────────────────────────────────────────
 
 model User {
@@ -48,40 +92,60 @@ model User {
   passwordHash String   @map("password_hash")
   name         String
   role         UserRole
+  llmProvider       String?  @map("llm_provider")       // e.g. "openai"
+  encryptedApiKey   String?  @map("encrypted_api_key")
+  llmModel          String?  @map("llm_model")          // e.g. "gpt-4o-mini"
   createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz
   updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz
 
-  taughtCourses  Course[]        @relation("TeacherCourses")
-  enrollments    Enrollment[]
-  attempts       Attempt[]
-  gradingResults GradingResult[] @relation("GraderResults")
-  masteries      UserMastery[]
+  taughtCourses     Course[]        @relation("TeacherCourses")
+  enrollments       Enrollment[]
+  attempts          Attempt[]
+  gradingResults    GradingResult[] @relation("GraderResults")
+  masteries         UserMastery[]
+  uploadedDocuments SourceDocument[] @relation("UploadedDocuments")
+  createdDrafts     ContentDraft[]   @relation("CreatedDrafts")
+
+  // Learning interventions
+  learningInterventions   LearningIntervention[]
+  spacedRepetitionCards   SpacedRepetitionCard[]
+  chatbotConversations    ChatbotConversation[]
 
   @@map("users")
 }
 
 model Course {
-  id          String   @id @default(uuid()) @db.Uuid
-  title       String
-  description String
-  teacherId   String   @map("teacher_id") @db.Uuid
-  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  id             String           @id @default(uuid()) @db.Uuid
+  title          String
+  description    String
+  teacherId      String           @map("teacher_id") @db.Uuid
+  status         CourseStatus     @default(DRAFT)
+  visibility     CourseVisibility @default(PRIVATE)
+  bannerBlobKey  String?          @map("banner_blob_key")
+  orderIndex     Int              @default(0) @map("order_index")
+  archivedAt     DateTime?        @map("archived_at") @db.Timestamptz
+  createdAt      DateTime         @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime         @updatedAt @map("updated_at") @db.Timestamptz
 
-  teacher     User         @relation("TeacherCourses", fields: [teacherId], references: [id], onDelete: Cascade)
-  topics      Topic[]
-  enrollments Enrollment[]
-  assessments Assessment[]
+  teacher         User             @relation("TeacherCourses", fields: [teacherId], references: [id], onDelete: Cascade)
+  topics          Topic[]
+  enrollments     Enrollment[]
+  assessments     Assessment[]
+  questions       Question[]
+  modules         CourseModule[]
+  sourceDocuments SourceDocument[]
+  contentDrafts   ContentDraft[]
 
   @@index([teacherId])
   @@map("courses")
 }
 
 model Enrollment {
-  id         String   @id @default(uuid()) @db.Uuid
-  studentId  String   @map("student_id") @db.Uuid
-  courseId    String   @map("course_id") @db.Uuid
-  enrolledAt DateTime @default(now()) @map("enrolled_at") @db.Timestamptz
+  id         String           @id @default(uuid()) @db.Uuid
+  studentId  String           @map("student_id") @db.Uuid
+  courseId    String           @map("course_id") @db.Uuid
+  status     EnrollmentStatus @default(ACTIVE)
+  enrolledAt DateTime         @default(now()) @map("enrolled_at") @db.Timestamptz
 
   student User   @relation(fields: [studentId], references: [id], onDelete: Cascade)
   course  Course @relation(fields: [courseId], references: [id], onDelete: Cascade)
@@ -92,17 +156,20 @@ model Enrollment {
 }
 
 model Topic {
-  id          String   @id @default(uuid()) @db.Uuid
-  courseId     String   @map("course_id") @db.Uuid
-  title       String
-  description String
-  orderIndex  Int      @map("order_index")
-  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  id               String   @id @default(uuid()) @db.Uuid
+  courseId          String   @map("course_id") @db.Uuid
+  title            String
+  description      String
+  orderIndex       Int      @map("order_index")
+  generationJobId  String?  @map("generation_job_id") @db.Uuid
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt        DateTime @updatedAt @map("updated_at") @db.Timestamptz
 
   course              Course               @relation(fields: [courseId], references: [id], onDelete: Cascade)
   questions           Question[]
   knowledgeComponents KnowledgeComponent[]
+  modules             CourseModule[]
+  proposedKCs         ProposedKC[]
 
   @@index([courseId])
   @@map("topics")
@@ -110,40 +177,72 @@ model Topic {
 
 model Question {
   id         String       @id @default(uuid()) @db.Uuid
-  topicId    String       @map("topic_id") @db.Uuid
+  courseId    String?      @map("course_id") @db.Uuid
+  topicId    String?      @map("topic_id") @db.Uuid
   version    Int          @default(1)
-  prompt     String
+  prompt     String                              // legacy: plain text stem
+  stem       Json?                               // rich content blocks (new)
   type       QuestionType
   maxScore   Float        @map("max_score")
   rubricJson Json?        @map("rubric_json")
+
+  // MCQ fields (JSON arrays)
+  options         Json?                           // [{id, text, isCorrect}]
+  correctOptionId String?  @map("correct_option_id") // MCQ_SINGLE: id of correct option
+  correctAnswer   Json?    @map("correct_answer")   // STRUCTURED: rubric/key points/sample solution
+
+  // Rich explanation / worked solution
+  explanation Json?                               // rich blocks for worked solution
+
+  // Tags (stored as JSON for flexibility)
+  difficulty        Int?     @default(3)           // 1-5
+  bloomsLevel       String?  @map("blooms_level")  // remember/understand/apply/analyze/evaluate/create
+  kcIds             String[] @map("kc_ids") @db.Uuid   // course-scoped KC links
+  pageIds           String[] @map("page_ids") @db.Uuid  // links to lesson pages
+  tags              Json?                          // additional custom tags
+
+  // Metadata
+  status     String   @default("draft")           // draft/approved/archived
+  createdBy  String?  @map("created_by")          // "admin" | "ai"
+  sourceType String?  @map("source_type")         // "lesson_based" | "uploaded" | "mixed"
+  provenance Json?                                // {sourceDocIds, chunkIds}
+
   createdAt  DateTime     @default(now()) @map("created_at") @db.Timestamptz
   updatedAt  DateTime     @updatedAt @map("updated_at") @db.Timestamptz
 
-  topic               Topic                @relation(fields: [topicId], references: [id], onDelete: Cascade)
+  course              Course?              @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  topic               Topic?               @relation(fields: [topicId], references: [id], onDelete: Cascade)
   attempts            Attempt[]
   assessmentQuestions AssessmentQuestion[]
   questionKcs         QuestionKc[]
 
+  @@index([courseId])
   @@index([topicId])
+  @@index([status])
+  @@index([type])
   @@map("questions")
 }
 
 model Attempt {
-  id             String        @id @default(uuid()) @db.Uuid
-  studentId      String        @map("student_id") @db.Uuid
-  questionId     String        @map("question_id") @db.Uuid
-  assessmentId   String?       @map("assessment_id") @db.Uuid
-  status         AttemptStatus @default(in_progress)
-  textResponse   String?       @map("text_response")
-  strokesJson    Json?         @map("strokes_json")
-  drawingBlobUrl String?       @map("drawing_blob_url")
-  currentScore   Float?        @map("current_score")
-  submittedAt    DateTime?     @map("submitted_at") @db.Timestamptz
-  createdAt      DateTime      @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt      DateTime      @updatedAt @map("updated_at") @db.Timestamptz
+  id               String        @id @default(uuid()) @db.Uuid
+  studentId        String        @map("student_id") @db.Uuid
+  questionId       String        @map("question_id") @db.Uuid
+  assessmentId     String?       @map("assessment_id") @db.Uuid
+  status           AttemptStatus @default(in_progress)
+  textResponse     String?       @map("text_response")
+  selectedOptionIds Json?        @map("selected_option_ids")  // string[] for MCQ answers
+  strokesJson      Json?         @map("strokes_json")
+  drawingBlobUrl   String?       @map("drawing_blob_url")
+  workingStrokes   Json?         @map("working_strokes")      // working/scratch canvas strokes (all types)
+  workingBlobUrl   String?       @map("working_blob_url")     // exported PNG of working
+  currentScore     Float?        @map("current_score")
+  autoFeedback     String?       @map("auto_feedback")        // auto-generated feedback for MCQ
+  submittedAt      DateTime?     @map("submitted_at") @db.Timestamptz
+  createdAt        DateTime      @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt        DateTime      @updatedAt @map("updated_at") @db.Timestamptz
 
-  student       User           @relation(fields: [studentId], references: [id], onDelete: Cascade)
-  question      Question       @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  student        User           @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  question       Question       @relation(fields: [questionId], references: [id], onDelete: Cascade)
   gradingResults GradingResult[]
 
   @@index([studentId])
@@ -187,6 +286,9 @@ model Assessment {
   courseId    String   @map("course_id") @db.Uuid
   title       String
   description String   @default("")
+  mode        String   @default("practice")        // "practice" | "test"
+  isPublished Boolean  @default(false) @map("is_published")
+  settings    Json?                                 // {timeLimit, maxAttempts, showSolutions, shuffle}
   createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
   updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz
 
@@ -198,10 +300,12 @@ model Assessment {
 }
 
 model AssessmentQuestion {
-  id           String @id @default(uuid()) @db.Uuid
-  assessmentId String @map("assessment_id") @db.Uuid
-  questionId   String @map("question_id") @db.Uuid
-  orderIndex   Int    @map("order_index")
+  id           String  @id @default(uuid()) @db.Uuid
+  assessmentId String  @map("assessment_id") @db.Uuid
+  questionId   String  @map("question_id") @db.Uuid
+  orderIndex   Int     @map("order_index")
+  points       Float?  @default(1)                // points for this question in this assessment
+  section      String?                            // optional section grouping
 
   assessment Assessment @relation(fields: [assessmentId], references: [id], onDelete: Cascade)
   question   Question   @relation(fields: [questionId], references: [id], onDelete: Cascade)
@@ -209,6 +313,196 @@ model AssessmentQuestion {
   @@unique([assessmentId, questionId])
   @@index([assessmentId])
   @@map("assessment_questions")
+}
+
+// ─── Course Modules & Items ─────────────────────────────
+
+model CourseModule {
+  id              String   @id @default(uuid()) @db.Uuid
+  courseId         String   @map("course_id") @db.Uuid
+  topicId         String?  @map("topic_id") @db.Uuid
+  title           String
+  orderIndex      Int      @map("order_index")
+  generationJobId String?  @map("generation_job_id") @db.Uuid
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  course      Course       @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  topic       Topic?       @relation(fields: [topicId], references: [id], onDelete: SetNull)
+  items       ModuleItem[]
+  proposedKCs ProposedKC[]
+
+  @@index([courseId])
+  @@index([topicId])
+  @@map("course_modules")
+}
+
+model ModuleItem {
+  id           String         @id @default(uuid()) @db.Uuid
+  moduleId     String         @map("module_id") @db.Uuid
+  type         ModuleItemType
+  title        String
+  orderIndex   Int            @map("order_index")
+
+  // PAGE type
+  contentMdx   String?        @map("content_mdx")
+
+  // PDF type
+  pdfBlobKey   String?        @map("pdf_blob_key")
+  pdfFilename  String?        @map("pdf_filename")
+  pdfSize      Int?           @map("pdf_size")
+
+  // LINK type
+  url          String?
+
+  // ASSESSMENT type
+  assessmentId String?        @map("assessment_id") @db.Uuid
+
+  // AI-generated metadata
+  learningOutcomes Json?    @map("learning_outcomes") // string[]
+  estimatedMinutes Int?     @map("estimated_minutes")
+  generationJobId  String?  @map("generation_job_id") @db.Uuid
+
+  createdAt    DateTime       @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt    DateTime       @updatedAt @map("updated_at") @db.Timestamptz
+
+  module   CourseModule          @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+  versions PageContentVersion[]
+
+  @@index([moduleId])
+  @@map("module_items")
+}
+
+model PageContentVersion {
+  id           String   @id @default(uuid()) @db.Uuid
+  itemId       String   @map("item_id") @db.Uuid
+  version      Int
+  contentJson  String   @map("content_json") // BlockDocument JSON
+  source       String   // "human" | "ai" | "rollback"
+  authorId     String?  @map("author_id") @db.Uuid
+  jobId        String?  @map("job_id") @db.Uuid
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  item ModuleItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  @@unique([itemId, version])
+  @@index([itemId])
+  @@map("page_content_versions")
+}
+
+// ─── RAG: Source Documents & Chunks ──────────────────────
+
+model SourceDocument {
+  id              String           @id @default(uuid()) @db.Uuid
+  courseId         String           @map("course_id") @db.Uuid
+  uploadedById    String           @map("uploaded_by_id") @db.Uuid
+  title           String
+  filename        String
+  blobKey         String           @map("blob_key")
+  mimeType        String           @map("mime_type")
+  sizeBytes       Int              @map("size_bytes")
+  pageCount       Int?             @map("page_count")
+  chunkingStrategy ChunkingStrategy @default(PARAGRAPH) @map("chunking_strategy")
+  chunkCount      Int              @default(0) @map("chunk_count")
+  indexedAt        DateTime?        @map("indexed_at") @db.Timestamptz
+  createdAt       DateTime         @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt       DateTime         @updatedAt @map("updated_at") @db.Timestamptz
+
+  course     Course          @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  uploadedBy User            @relation("UploadedDocuments", fields: [uploadedById], references: [id], onDelete: Cascade)
+  chunks     DocumentChunk[]
+
+  @@index([courseId])
+  @@map("source_documents")
+}
+
+model DocumentChunk {
+  id           String   @id @default(uuid()) @db.Uuid
+  documentId   String   @map("document_id") @db.Uuid
+  chunkIndex   Int      @map("chunk_index")
+  content      String
+  pageNumber   Int?     @map("page_number")
+  tokenCount   Int      @default(0) @map("token_count")
+  embedding    Json?    // stored as float array in JSON
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  document SourceDocument @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@unique([documentId, chunkIndex])
+  @@index([documentId])
+  @@map("document_chunks")
+}
+
+// ─── LLM: Content Drafts & Audit Logs ───────────────────
+
+model ContentDraft {
+  id           String      @id @default(uuid()) @db.Uuid
+  courseId      String      @map("course_id") @db.Uuid
+  createdById  String      @map("created_by_id") @db.Uuid
+  title        String
+  contentMdx   String      @map("content_mdx")
+  citations    Json?       // [{chunkId, documentTitle, pageNumber, quote}]
+  status       DraftStatus @default(DRAFT)
+  reviewedAt   DateTime?   @map("reviewed_at") @db.Timestamptz
+  version      Int         @default(1)
+  parentDraftId String?    @map("parent_draft_id") @db.Uuid
+  createdAt    DateTime    @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt    DateTime    @updatedAt @map("updated_at") @db.Timestamptz
+
+  course    Course  @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  createdBy User    @relation("CreatedDrafts", fields: [createdById], references: [id], onDelete: Cascade)
+  auditLogs LlmAuditLog[]
+
+  @@index([courseId])
+  @@index([createdById])
+  @@map("content_drafts")
+}
+
+model LlmGenerationJob {
+  id             String               @id @default(uuid()) @db.Uuid
+  courseId        String               @map("course_id") @db.Uuid
+  userId         String               @map("user_id") @db.Uuid
+  status         GenerationJobStatus  @default(PENDING)
+  jobType        String               @map("job_type") // "course_structure"
+  inputPayload   Json                 @map("input_payload")
+  outputPayload  Json?                @map("output_payload")
+  retrievedChunkIds Json?             @map("retrieved_chunk_ids") // string[]
+  errorMessage   String?              @map("error_message")
+  model          String?              // LLM model used
+  promptTokens   Int                  @default(0) @map("prompt_tokens")
+  completionTokens Int                @default(0) @map("completion_tokens")
+  durationMs     Int                  @default(0) @map("duration_ms")
+  startedAt      DateTime?            @map("started_at") @db.Timestamptz
+  completedAt    DateTime?            @map("completed_at") @db.Timestamptz
+  createdAt      DateTime             @default(now()) @map("created_at") @db.Timestamptz
+
+  @@index([courseId])
+  @@index([userId])
+  @@index([status])
+  @@map("llm_generation_jobs")
+}
+
+model LlmAuditLog {
+  id             String   @id @default(uuid()) @db.Uuid
+  draftId        String?  @map("draft_id") @db.Uuid
+  courseId        String   @map("course_id") @db.Uuid
+  userId         String   @map("user_id") @db.Uuid
+  action         String   // e.g. "generate_content", "query_rag", "validate_citations"
+  model          String   // e.g. "claude-3-sonnet", "text-embedding-3-small"
+  promptTokens   Int      @default(0) @map("prompt_tokens")
+  completionTokens Int    @default(0) @map("completion_tokens")
+  durationMs     Int      @default(0) @map("duration_ms")
+  inputPayload   Json?    @map("input_payload")   // query, settings
+  outputPayload  Json?    @map("output_payload")  // response, chunks used
+  errorMessage   String?  @map("error_message")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  draft  ContentDraft? @relation(fields: [draftId], references: [id], onDelete: SetNull)
+
+  @@index([courseId])
+  @@index([userId])
+  @@index([draftId])
+  @@map("llm_audit_logs")
 }
 
 // ─── Knowledge Components & Mastery ─────────────────────
@@ -285,4 +579,349 @@ model UserMastery {
   @@index([userId])
   @@index([kcId])
   @@map("user_mastery")
+}
+
+// ─── Content Evaluation ─────────────────────────────────
+
+enum EvaluationRunStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+model EvaluationRun {
+  id             String              @id @default(uuid()) @db.Uuid
+  courseId        String              @map("course_id") @db.Uuid
+  userId         String              @map("user_id") @db.Uuid
+  status         EvaluationRunStatus @default(PENDING)
+  config         Json                // {rubrics, strictness, depth, customPrompt, pageIds}
+  summary        Json?               // aggregate scores
+  errorMessage   String?             @map("error_message")
+  startedAt      DateTime?           @map("started_at") @db.Timestamptz
+  completedAt    DateTime?           @map("completed_at") @db.Timestamptz
+  createdAt      DateTime            @default(now()) @map("created_at") @db.Timestamptz
+
+  results PageEvalResult[]
+
+  @@index([courseId])
+  @@index([userId])
+  @@map("evaluation_runs")
+}
+
+model PageEvalResult {
+  id              String   @id @default(uuid()) @db.Uuid
+  runId           String   @map("run_id") @db.Uuid
+  itemId          String   @map("item_id") @db.Uuid
+  itemTitle       String   @map("item_title")
+  scores          Json     // {formatting, equations, pedagogy, rigor, overall}
+  issues          Json     // [{category, severity, location, message, suggestedFix}]
+  mathIssues      Json?    @map("math_issues") // deterministic math normalizer findings
+  fixesApplied    Boolean  @default(false) @map("fixes_applied")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  run EvaluationRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@index([runId])
+  @@index([itemId])
+  @@map("page_eval_results")
+}
+
+// ─── Proposed Knowledge Components (AI-generated) ───────
+
+enum ProposedKCStatus {
+  PROPOSED
+  APPROVED
+  ARCHIVED
+}
+
+model ProposedKC {
+  id               String           @id @default(uuid()) @db.Uuid
+  courseId          String           @map("course_id") @db.Uuid
+  name             String
+  description      String?
+  status           ProposedKCStatus @default(PROPOSED)
+  confidenceLevel  String           @default("MEDIUM") @map("confidence_level") // LOW, MEDIUM, HIGH
+  createdBy        String           @default("ai") @map("created_by") // "ai" or "human"
+  generationJobId  String?          @map("generation_job_id") @db.Uuid
+  relatedToKCId    String?          @map("related_to_kc_id") @db.Uuid
+  evidence         Json             @default("[]") // [{pageId, blockIds, chunkIds}]
+  pageIds          String[]         @map("page_ids") @db.Uuid
+  topicId          String?          @map("topic_id") @db.Uuid
+  subtopicId       String?          @map("subtopic_id") @db.Uuid // references CourseModule id
+  createdAt        DateTime         @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt        DateTime         @updatedAt @map("updated_at") @db.Timestamptz
+
+  relatedTo ProposedKC? @relation("KCDuplicates", fields: [relatedToKCId], references: [id], onDelete: SetNull)
+  duplicates ProposedKC[] @relation("KCDuplicates")
+  topic     Topic?        @relation(fields: [topicId], references: [id], onDelete: SetNull)
+  subtopic  CourseModule? @relation(fields: [subtopicId], references: [id], onDelete: SetNull)
+
+  // Graph edges where this KC is source or target
+  outgoingEdges KcEdge[] @relation("KcEdgeFrom")
+  incomingEdges KcEdge[] @relation("KcEdgeTo")
+
+  // Content mappings
+  contentMappings KcContentMapping[]
+
+  @@index([courseId])
+  @@index([status])
+  @@index([courseId, status])
+  @@index([topicId])
+  @@index([subtopicId])
+  @@map("proposed_kcs")
+}
+
+// ─── Knowledge Graph Edges (prerequisite relationships) ──
+
+model KcEdge {
+  id           String   @id @default(uuid()) @db.Uuid
+  courseId      String   @map("course_id") @db.Uuid
+  fromKcId     String   @map("from_kc_id") @db.Uuid
+  toKcId       String   @map("to_kc_id") @db.Uuid
+  relationship String   @default("prerequisite") // "prerequisite" | "related" | "builds_on"
+  weight       Float    @default(1.0)
+  createdBy    String   @default("ai") @map("created_by") // "ai" or "human"
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  fromKc ProposedKC @relation("KcEdgeFrom", fields: [fromKcId], references: [id], onDelete: Cascade)
+  toKc   ProposedKC @relation("KcEdgeTo", fields: [toKcId], references: [id], onDelete: Cascade)
+
+  @@unique([fromKcId, toKcId])
+  @@index([courseId])
+  @@map("kc_edges")
+}
+
+// ─── KC-to-Content Mapping Strength ─────────────────────
+
+model KcContentMapping {
+  id         String   @id @default(uuid()) @db.Uuid
+  courseId    String   @map("course_id") @db.Uuid
+  kcId       String   @map("kc_id") @db.Uuid
+  pageId     String   @map("page_id") @db.Uuid
+  strength   String   @default("MEDIUM") // LOW, MEDIUM, HIGH
+  blockIds   String[] @map("block_ids") // specific block IDs within the page
+  createdBy  String   @default("ai") @map("created_by") // "ai" or "human"
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt  DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  kc ProposedKC @relation(fields: [kcId], references: [id], onDelete: Cascade)
+
+  @@unique([kcId, pageId])
+  @@index([courseId])
+  @@index([pageId])
+  @@index([kcId])
+  @@map("kc_content_mappings")
+}
+
+// ─── Knowledge-Level Versioning ──────────────────────────
+
+model KnowledgeVersion {
+  id            String   @id @default(uuid()) @db.Uuid
+  courseId      String   @map("course_id") @db.Uuid
+  version       Int
+  changeSummary String   @map("change_summary")
+  changeType    String   @map("change_type") // KC_APPROVE, KC_EDIT, KC_MERGE, KC_ARCHIVE, KC_DELETE, EDGE_ADD, EDGE_UPDATE, EDGE_DELETE, EDGE_GENERATE, MAPPING_ADD, MAPPING_UPDATE, MAPPING_DELETE, MAPPING_AUTO_GENERATE, RESTORE
+  source        String   @default("human") // "human" | "ai" | "restore"
+  authorId      String?  @map("author_id") @db.Uuid
+  snapshotKcs   Json     @map("snapshot_kcs")      // ProposedKC[] snapshot
+  snapshotEdges Json     @map("snapshot_edges")     // KcEdge[] snapshot
+  snapshotMaps  Json     @map("snapshot_maps")      // KcContentMapping[] snapshot
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  @@unique([courseId, version])
+  @@index([courseId])
+  @@map("knowledge_versions")
+}
+
+// ─── Curriculum Coverage & Gap Mapping ───────────────────
+
+model CurriculumCoverageRun {
+  id              String              @id @default(uuid()) @db.Uuid
+  courseId         String              @map("course_id") @db.Uuid
+  userId          String              @map("user_id") @db.Uuid
+  status          EvaluationRunStatus @default(PENDING)
+  syllabusText    String              @map("syllabus_text")  // raw syllabus/curriculum input
+  parsedOutcomes  Json?               @map("parsed_outcomes")  // SyllabusOutcome[]
+  outcomeKcMaps   Json?               @map("outcome_kc_maps")  // OutcomeKcMap[]
+  coverageResults Json?               @map("coverage_results") // CoverageAnalysisOutput
+  errorMessage    String?             @map("error_message")
+  startedAt       DateTime?           @map("started_at") @db.Timestamptz
+  completedAt     DateTime?           @map("completed_at") @db.Timestamptz
+  createdAt       DateTime            @default(now()) @map("created_at") @db.Timestamptz
+
+  @@index([courseId])
+  @@index([userId])
+  @@map("curriculum_coverage_runs")
+}
+
+// ─── Publish Gate Audit ──────────────────────────────────
+
+model PublishGateRun {
+  id              String   @id @default(uuid()) @db.Uuid
+  courseId         String   @map("course_id") @db.Uuid
+  userId          String   @map("user_id") @db.Uuid
+  checks          Json     // PublishGateCheck[]
+  overallPass     Boolean  @map("overall_pass")
+  overridden      Boolean  @default(false)
+  overrideReason  String?  @map("override_reason")
+  published       Boolean  @default(false)
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  @@index([courseId])
+  @@index([userId])
+  @@map("publish_gate_runs")
+}
+
+// ─── KC Graph Layout Persistence ────────────────────────
+
+model KcGraphLayout {
+  id         String   @id @default(uuid()) @db.Uuid
+  courseId   String   @unique @map("course_id") @db.Uuid
+  layoutJson Json     @map("layout_json") // {nodes: {id, x, y, radius}[], viewBox: {x, y, w, h}}
+  updatedAt  DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@map("kc_graph_layouts")
+}
+
+// ─── KC-Aware Evaluation ────────────────────────────────
+
+model KcEvaluationRun {
+  id              String              @id @default(uuid()) @db.Uuid
+  courseId         String              @map("course_id") @db.Uuid
+  userId          String              @map("user_id") @db.Uuid
+  status          EvaluationRunStatus @default(PENDING)
+  scope           Json                // {type: 'course'|'pages', pageIds?: string[]}
+  depth           String              @default("quick") // "quick" | "deep"
+  results         Json?               // Full KcEvaluationOutput JSON
+  errorMessage    String?             @map("error_message")
+  startedAt       DateTime?           @map("started_at") @db.Timestamptz
+  completedAt     DateTime?           @map("completed_at") @db.Timestamptz
+  createdAt       DateTime            @default(now()) @map("created_at") @db.Timestamptz
+
+  @@index([courseId])
+  @@index([userId])
+  @@map("kc_evaluation_runs")
+}
+
+// ─── Learning Interventions ─────────────────────────────
+
+enum InterventionType {
+  PRACTICE_TESTING
+  DISTRIBUTED_PRACTICE
+  STEPWISE_LEARNING
+  INTERROGATIVE_ELABORATION
+}
+
+model LearningIntervention {
+  id               String           @id @default(uuid()) @db.Uuid
+  userId           String           @map("user_id") @db.Uuid
+  courseId         String           @map("course_id") @db.Uuid
+  contentId        String           @map("content_id") @db.Uuid
+  selectedText     String           @db.Text @map("selected_text")
+  interventionType InterventionType @map("intervention_type")
+  pageType         String?          @map("page_type") // "lesson", "quiz", "reading", "dashboard", etc.
+  createdAt        DateTime         @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt        DateTime         @updatedAt @map("updated_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  practiceTests         PracticeTest[]
+  stepwiseSessions      StepwiseSession[]
+  elaborationSessions   ElaborationSession[]
+  spacedRepetitionCards SpacedRepetitionCard[]
+
+  @@index([userId])
+  @@index([courseId])
+  @@index([contentId])
+  @@map("learning_interventions")
+}
+
+model PracticeTest {
+  id             String    @id @default(uuid()) @db.Uuid
+  interventionId String    @map("intervention_id") @db.Uuid
+  questions      Json      // Array of {question, type, options?, correctAnswer, explanation}
+  userAnswers    Json?     @map("user_answers") // Array of {questionIndex, answer, isCorrect, submittedAt}
+  score          Float?
+  completedAt    DateTime? @map("completed_at") @db.Timestamptz
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  intervention LearningIntervention @relation(fields: [interventionId], references: [id], onDelete: Cascade)
+
+  @@index([interventionId])
+  @@map("practice_tests")
+}
+
+model SpacedRepetitionCard {
+  id             String    @id @default(uuid()) @db.Uuid
+  interventionId String    @map("intervention_id") @db.Uuid
+  userId         String    @map("user_id") @db.Uuid
+  front          String    @db.Text
+  back           String    @db.Text
+  ease           Float     @default(2.5)
+  interval       Int       @default(1)
+  repetitions    Int       @default(0)
+  nextReviewAt   DateTime  @default(now()) @map("next_review_at") @db.Timestamptz
+  lastReviewedAt DateTime? @map("last_reviewed_at") @db.Timestamptz
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+
+  intervention LearningIntervention @relation(fields: [interventionId], references: [id], onDelete: Cascade)
+  user         User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([interventionId])
+  @@index([userId])
+  @@index([nextReviewAt])
+  @@map("spaced_repetition_cards")
+}
+
+model StepwiseSession {
+  id             String    @id @default(uuid()) @db.Uuid
+  interventionId String    @map("intervention_id") @db.Uuid
+  steps          Json      // Array of {stepNumber, title, content, comprehensionCheck}
+  summary        String?   @db.Text
+  totalSteps     Int       @default(0) @map("total_steps")
+  sourceText     String?   @map("source_text") @db.Text
+  currentStep    Int       @default(0) @map("current_step")
+  userResponses  Json?     @map("user_responses") // Array of {stepNumber, response, feedback}
+  completedAt    DateTime? @map("completed_at") @db.Timestamptz
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  intervention LearningIntervention @relation(fields: [interventionId], references: [id], onDelete: Cascade)
+
+  @@index([interventionId])
+  @@map("stepwise_sessions")
+}
+
+model ElaborationSession {
+  id               String    @id @default(uuid()) @db.Uuid
+  interventionId   String    @map("intervention_id") @db.Uuid
+  questions        Json      // Array of {question, type: "why" | "how", keyPoints}
+  sourceText       String?   @map("source_text") @db.Text
+  userElaborations Json?     @map("user_elaborations") // Array of {questionIndex, elaboration, aiFeedback, score}
+  completedAt      DateTime? @map("completed_at") @db.Timestamptz
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  intervention LearningIntervention @relation(fields: [interventionId], references: [id], onDelete: Cascade)
+
+  @@index([interventionId])
+  @@map("elaboration_sessions")
+}
+
+model ChatbotConversation {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  courseId  String?  @map("course_id") @db.Uuid
+  contentId String?  @map("content_id") @db.Uuid
+  pageType  String?  @map("page_type") // "lesson", "quiz", "reading", "dashboard", etc.
+  messages  Json     // Array of {role: "user" | "assistant", content: string, timestamp: string}
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([courseId])
+  @@map("chatbot_conversations")
 }
