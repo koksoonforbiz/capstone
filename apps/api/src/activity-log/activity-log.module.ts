@@ -4,9 +4,10 @@ import { ActivityLogService } from './activity-log.service';
 import { SessionService } from './session.service';
 import { LogExportService } from './log-export.service';
 import { ActivityLogController } from './activity-log.controller';
+import { LearningEpisodeModule } from '../learning-episode/episode-grouping.module';
 
 @Module({
-  imports: [ConfigModule],
+  imports: [ConfigModule, LearningEpisodeModule],
   controllers: [ActivityLogController],
   providers: [ActivityLogService, SessionService, LogExportService],
   exports: [ActivityLogService, SessionService],

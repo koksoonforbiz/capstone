@@ -1,11 +1,15 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { EpisodeGroupingService } from '../learning-episode/episode-grouping.service';
 
 @Injectable()
 export class SessionService {
   private readonly logger = new Logger(SessionService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly episodeGrouping: EpisodeGroupingService,
+  ) {}
 
   /** Called when a student authenticates (login or token refresh). */
   async openSession(params: {
@@ -13,6 +17,8 @@ export class SessionService {
     courseId?: string;
     ipAddress?: string;
     userAgent?: string;
+    /** From X-Learning-Episode-Id header (Stage 2 of prompt_retro/). */
+    clientEpisodeId?: string;
   }): Promise<string> {
     const session = await this.prisma.studentSession.create({
       data: {
@@ -22,17 +28,66 @@ export class SessionService {
         userAgent: params.userAgent ?? null,
       },
     });
+
+    // Attach to a LearningEpisode if we have a course context. Sessions
+    // created without a courseId (rare — mostly token-only refreshes) are
+    // grouped lazily once setCourseId() runs.
+    if (session.courseId) {
+      await this.tryAttachEpisode({
+        sessionId: session.id,
+        userId: session.userId,
+        courseId: session.courseId,
+        startedAt: session.startedAt,
+        userAgent: session.userAgent,
+        ipAddress: session.ipAddress,
+        clientEpisodeId: params.clientEpisodeId,
+      });
+    }
+
     this.logger.log(`Session opened: ${session.id} for user ${params.userId}`);
     return session.id;
   }
 
   /** Associate a courseId with an existing session (idempotent). */
   async setCourseId(sessionId: string, courseId: string): Promise<void> {
-    await this.prisma.studentSession.update({
+    const session = await this.prisma.studentSession.update({
       where: { id: sessionId },
       data: { courseId },
     });
+    // First time we know which course this session belongs to — try to
+    // group it into an episode now.
+    if (!session.episodeId) {
+      await this.tryAttachEpisode({
+        sessionId: session.id,
+        userId: session.userId,
+        courseId,
+        startedAt: session.startedAt,
+        userAgent: session.userAgent,
+        ipAddress: session.ipAddress,
+      });
+    }
     this.logger.log(`Session ${sessionId} linked to course ${courseId}`);
+  }
+
+  /** Best-effort wrapper — episode grouping must never block session work. */
+  private async tryAttachEpisode(input: {
+    sessionId: string;
+    userId: string;
+    courseId: string;
+    startedAt: Date;
+    userAgent: string | null;
+    ipAddress: string | null;
+    clientEpisodeId?: string;
+  }): Promise<void> {
+    try {
+      await this.episodeGrouping.assignEpisodeForSession(input);
+    } catch (err) {
+      this.logger.warn(
+        `episode grouping failed for session ${input.sessionId}: ${
+          err instanceof Error ? err.message : err
+        }`,
+      );
+    }
   }
 
   /**
@@ -49,10 +104,25 @@ export class SessionService {
     const endedAt = new Date();
     const durationSecs = Math.floor((endedAt.getTime() - session.startedAt.getTime()) / 1000);
 
-    await this.prisma.studentSession.update({
+    const updated = await this.prisma.studentSession.update({
       where: { id: sessionId },
       data: { endedAt, durationSecs },
+      select: { episodeId: true },
     });
+
+    // Roll the new endedAt / duration into the episode aggregate so the
+    // episode picker shows accurate totals without a separate sweep job.
+    if (updated.episodeId) {
+      try {
+        await this.episodeGrouping.recomputeEpisodeAggregates(updated.episodeId);
+      } catch (err) {
+        this.logger.warn(
+          `episode aggregate recompute failed for ${updated.episodeId}: ${
+            err instanceof Error ? err.message : err
+          }`,
+        );
+      }
+    }
 
     await this.buildSummary(sessionId);
     this.logger.log(`Session closed: ${sessionId} — ${durationSecs}s`);
