@@ -278,6 +278,7 @@ model User {
   studentSessions          StudentSession[]
   activityLogs             ActivityLog[]
   sessionSummaries         SessionSummary[]
+  learningEpisodes         LearningEpisode[]
 
   // Biometrics relations
   recordingSegments    RecordingSegment[]
@@ -329,6 +330,9 @@ model Course {
   pyfeatConfig           PyfeatConfig?
   affectiveMappingConfig AffectiveMappingConfig?
   pyfeatJobs             PyfeatJob[]
+
+  // Retrospective tracing
+  learningEpisodes LearningEpisode[]
 
   @@index([teacherId])
   @@map("courses")
@@ -1352,6 +1356,13 @@ model StudentSession {
   courseId String? @map("course_id") @db.Uuid
   course   Course? @relation(fields: [courseId], references: [id], onDelete: SetNull)
 
+  // Retrospective-tracing grouping (Stage 1 of prompt_retro/).
+  // Multiple StudentSession rows may belong to the same LearningEpisode when
+  // a student refreshes the browser, briefly loses connection, or reopens a
+  // tab during the same study sitting.
+  episodeId String?          @map("episode_id") @db.Uuid
+  episode   LearningEpisode? @relation(fields: [episodeId], references: [id], onDelete: SetNull)
+
   startedAt    DateTime  @default(now()) @map("started_at") @db.Timestamptz
   endedAt      DateTime? @map("ended_at") @db.Timestamptz
   durationSecs Int?      @map("duration_secs")
@@ -1377,7 +1388,60 @@ model StudentSession {
 
   @@index([userId])
   @@index([userId, startedAt])
+  @@index([episodeId])
   @@map("student_sessions")
+}
+
+// ─── Retrospective tracing (prompt_retro Stage 1) ──────────────────────────
+//
+// LearningEpisode groups one-or-more StudentSession rows that represent a
+// single study sitting. Three layers of grouping populate it:
+//   1. client_episode_id — strongest signal, set from X-Learning-Episode-Id
+//      header that the browser persists in localStorage (Stage 2).
+//   2. auto_heuristic — server-side fallback comparing gap + user-agent +
+//      IP between consecutive sessions (Stage 1 EpisodeGroupingService).
+//   3. manual — researcher merge/split via the teacher portal (Stage 6).
+//
+// All assignment decisions are journalled in EpisodeAudit so post-hoc
+// diagnostics can reconstruct exactly how an episode was assembled.
+
+model LearningEpisode {
+  id                 String    @id @default(uuid()) @db.Uuid
+  userId             String    @map("user_id") @db.Uuid
+  courseId           String    @map("course_id") @db.Uuid
+  startedAt          DateTime  @map("started_at") @db.Timestamptz
+  endedAt            DateTime? @map("ended_at") @db.Timestamptz
+  totalActiveSecs    Int       @default(0) @map("total_active_secs")
+  sessionCount       Int       @default(0) @map("session_count")
+  groupingMethod     String    @map("grouping_method") // "client_episode_id" | "auto_heuristic" | "auto_heuristic_backfill" | "manual"
+  groupingConfidence Float?    @map("grouping_confidence") // 0..1, null for client-provided or manual
+  notes              String?
+
+  user     User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  course   Course           @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  sessions StudentSession[]
+  audits   EpisodeAudit[]
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@index([userId, courseId, startedAt])
+  @@index([courseId, startedAt])
+  @@map("learning_episodes")
+}
+
+model EpisodeAudit {
+  id          String   @id @default(uuid()) @db.Uuid
+  episodeId   String   @map("episode_id") @db.Uuid
+  action      String // "created" | "merged" | "split" | "annotated" | "session_attached" | "session_detached"
+  actorUserId String?  @map("actor_user_id") @db.Uuid // null for system actions (e.g. heuristic grouping)
+  payload     Json // context-dependent: e.g. { mergedFromIds: [...] }, { splitAtSessionId: ... }
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  episode LearningEpisode @relation(fields: [episodeId], references: [id], onDelete: Cascade)
+
+  @@index([episodeId, createdAt])
+  @@map("episode_audits")
 }
 
 model ActivityLog {
