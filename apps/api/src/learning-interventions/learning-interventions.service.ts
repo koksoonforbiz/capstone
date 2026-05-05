@@ -312,6 +312,100 @@ export class LearningInterventionsService {
     };
   }
 
+  // ─── Shared input resolver ────────────────────────────────
+  //
+  // Replaces the four hard `selectedText must be at least 20 chars` 4xx
+  // guards with a fallback that pulls top-K chunks of the course's
+  // uploaded materials when the student hasn't selected any text. This
+  // matches the behaviour of `chat()` and is what the user expects: an
+  // intervention triggered without a text selection should still be
+  // grounded in *something the teacher uploaded*, not free-styled by the
+  // LLM.
+  //
+  // If the course has no indexed material yet (no DocumentChunk rows),
+  // we fail loudly instead of silently feeding the LLM an empty context
+  // — that's the failure mode that produces the "random content" bug.
+  //
+  // Caller passes the DTO. Returns a single string ready to drop into
+  // {{selectedText}} in the existing prompt templates.
+
+  private async resolveInterventionContext(dto: {
+    selectedText?: string;
+    courseId: string;
+    contentId?: string;
+    topic?: string;
+  }): Promise<{ text: string; source: 'selection' | 'rag' }> {
+    const sel = (dto.selectedText ?? '').trim();
+    if (sel.length >= 20) {
+      return { text: dto.selectedText!, source: 'selection' };
+    }
+
+    if (!dto.courseId) {
+      throw new BadRequestException('courseId is required');
+    }
+
+    // Build a RAG query. Best signal first:
+    //   1. explicit `topic` from the frontend
+    //   2. contentId → page/module item title
+    //   3. course title
+    let query = (dto.topic ?? '').trim();
+    if (!query && dto.contentId) {
+      query = await this.deriveQueryFromContentId(dto.contentId);
+    }
+    if (!query) {
+      const course = await this.prisma.course.findUnique({
+        where: { id: dto.courseId },
+        select: { title: true },
+      });
+      query = course?.title ?? 'key concepts';
+    }
+
+    const chunks = await this.ragService.queryChunks(dto.courseId, query, 5);
+    if (chunks.length === 0) {
+      // Q2 — clear error. Don't feed the LLM nothing; tell the user
+      // what's actually missing.
+      throw new BadRequestException(
+        'This course has no indexed material yet. ' +
+          'Either highlight some text on the page to base the intervention on, ' +
+          'or ask your teacher to upload course content (PDFs, slides, etc.) ' +
+          'before triggering an intervention without a selection.',
+      );
+    }
+
+    // Concatenate the top chunks with light formatting. Cap each chunk
+    // at ~500 chars so we don't blow the token budget on prompts that
+    // expect a short cohesive passage.
+    const MAX_CHARS = 500;
+    const text = chunks
+      .map((c, i) => {
+        const snippet =
+          c.content.length > MAX_CHARS
+            ? c.content.slice(0, MAX_CHARS).trim() + '…'
+            : c.content.trim();
+        return `[Source ${i + 1} — ${c.documentTitle}]\n${snippet}`;
+      })
+      .join('\n\n');
+    return { text, source: 'rag' };
+  }
+
+  /** Best-effort: try to map `contentId` to a human-readable string the
+   *  TF-IDF query can match against. Modules and module items have
+   *  titles; bare page slugs don't, so we bail out gracefully. */
+  private async deriveQueryFromContentId(contentId: string): Promise<string> {
+    try {
+      const moduleItem = await this.prisma.moduleItem.findUnique({
+        where: { id: contentId },
+        select: { title: true, module: { select: { title: true } } },
+      });
+      if (moduleItem) {
+        return [moduleItem.module?.title, moduleItem.title].filter(Boolean).join(' — ');
+      }
+    } catch {
+      /* ignore — contentId may not be a uuid */
+    }
+    return '';
+  }
+
   // ─── Practice Testing ─────────────────────────────────────
 
   async generatePracticeTest(
@@ -319,12 +413,14 @@ export class LearningInterventionsService {
     dto: GeneratePracticeTestDto,
     sessionId?: string,
   ): Promise<PracticeTestResult> {
-    if (!dto.selectedText || dto.selectedText.trim().length < 20) {
-      throw new BadRequestException('Selected text must be at least 20 characters');
-    }
-
     if (!dto.courseId) {
       throw new BadRequestException('courseId is required');
+    }
+
+    // Resolve context: either selected text, or RAG over course material.
+    const ctx = await this.resolveInterventionContext(dto);
+    if (ctx.source === 'rag') {
+      this.logger.log(`Practice test: no selection, grounded on course material (${dto.courseId})`);
     }
 
     const teacherId = await this.getCourseTeacherIdWithApiKey(dto.courseId);
@@ -334,11 +430,7 @@ export class LearningInterventionsService {
     // Get system prompt (custom or default)
     const systemPrompt = await this.getSystemPrompt(dto.courseId, 'PRACTICE_TESTING');
 
-    const { system, user } = buildPracticeTestingPrompt(
-      systemPrompt,
-      dto.selectedText,
-      questionCount,
-    );
+    const { system, user } = buildPracticeTestingPrompt(systemPrompt, ctx.text, questionCount);
 
     // Call LLM with retry on malformed JSON
     let questions: PracticeQuestion[];
@@ -374,7 +466,9 @@ export class LearningInterventionsService {
         pageType: dto.pageType || null,
         type: 'PRACTICE_TESTING',
         status: 'IN_PROGRESS',
-        selectedText: dto.selectedText,
+        // Persist what the LLM actually saw — selection or RAG context —
+        // so downstream grading replays use the same grounding.
+        selectedText: ctx.text,
         sessionData: { questions: questions! } as unknown as Prisma.InputJsonValue,
       },
     });
@@ -555,12 +649,15 @@ export class LearningInterventionsService {
     dto: GenerateSuggestionsDto,
     sessionId?: string,
   ): Promise<SuggestionResult> {
-    if (!dto.selectedText || dto.selectedText.trim().length < 20) {
-      throw new BadRequestException('Selected text must be at least 20 characters');
-    }
-
     if (!dto.courseId) {
       throw new BadRequestException('courseId is required');
+    }
+
+    const ctx = await this.resolveInterventionContext(dto);
+    if (ctx.source === 'rag') {
+      this.logger.log(
+        `Interrogative elaboration: no selection, grounded on course material (${dto.courseId})`,
+      );
     }
 
     const teacherId = await this.getCourseTeacherIdWithApiKey(dto.courseId);
@@ -570,11 +667,7 @@ export class LearningInterventionsService {
     // Get system prompt (custom or default)
     const systemPrompt = await this.getSystemPrompt(dto.courseId, 'INTERROGATIVE_ELABORATION');
 
-    const { system, user } = buildQuestionSuggestionPrompt(
-      systemPrompt,
-      dto.selectedText,
-      questionCount,
-    );
+    const { system, user } = buildQuestionSuggestionPrompt(systemPrompt, ctx.text, questionCount);
 
     // Call LLM with retry on malformed JSON
     let suggestedQuestions: SuggestedQuestion[];
@@ -615,12 +708,12 @@ export class LearningInterventionsService {
         pageType: dto.pageType || null,
         type: 'INTERROGATIVE_ELABORATION',
         status: 'IN_PROGRESS',
-        selectedText: dto.selectedText,
+        selectedText: ctx.text,
         sessionData: {
           suggestedQuestions: suggestedQuestions!,
           keyConcepts,
           conversation: [],
-          selectedText: dto.selectedText,
+          selectedText: ctx.text,
           questionsAsked: 0,
         } as unknown as Prisma.InputJsonValue,
       },
@@ -826,18 +919,21 @@ export class LearningInterventionsService {
     steps: Array<{ stepNumber: number; title: string }>;
     totalSteps: number;
   }> {
-    if (!dto.selectedText || dto.selectedText.trim().length < 20) {
-      throw new BadRequestException('Selected text must be at least 20 characters');
-    }
-
     if (!dto.courseId) {
       throw new BadRequestException('courseId is required');
+    }
+
+    const ctx = await this.resolveInterventionContext(dto);
+    if (ctx.source === 'rag') {
+      this.logger.log(
+        `Stepwise learning: no selection, grounded on course material (${dto.courseId})`,
+      );
     }
 
     const teacherId = await this.getCourseTeacherIdWithApiKey(dto.courseId);
 
     const systemPrompt = await this.getSystemPrompt(dto.courseId, 'STEPWISE_LEARNING');
-    const { system, user } = buildStepwiseLearningPrompt(systemPrompt, dto.selectedText);
+    const { system, user } = buildStepwiseLearningPrompt(systemPrompt, ctx.text);
 
     let steps: StepwiseStep[];
     let summary = '';
@@ -874,12 +970,12 @@ export class LearningInterventionsService {
         pageType: dto.pageType || null,
         type: 'STEPWISE_LEARNING',
         status: 'IN_PROGRESS',
-        selectedText: dto.selectedText,
+        selectedText: ctx.text,
         sessionData: {
           steps: steps!,
           summary,
           currentStep: 1,
-          selectedText: dto.selectedText,
+          selectedText: ctx.text,
           stepResults: {},
         } as unknown as Prisma.InputJsonValue,
       },
@@ -1164,23 +1260,22 @@ export class LearningInterventionsService {
   // ─── Distributed Practice ─────────────────────────────────
 
   async generateCards(userId: string, dto: GenerateCardsDto, sessionId?: string) {
-    if (!dto.selectedText || dto.selectedText.trim().length < 20) {
-      throw new BadRequestException('Selected text must be at least 20 characters');
-    }
-
     if (!dto.courseId) {
       throw new BadRequestException('courseId is required');
+    }
+
+    const ctx = await this.resolveInterventionContext(dto);
+    if (ctx.source === 'rag') {
+      this.logger.log(
+        `Distributed practice: no selection, grounded on course material (${dto.courseId})`,
+      );
     }
 
     const teacherId = await this.getCourseTeacherIdWithApiKey(dto.courseId);
     const cardCount = Math.min(Math.max(dto.cardCount || 5, 1), 15);
 
     const systemPrompt = await this.getSystemPrompt(dto.courseId, 'DISTRIBUTED_PRACTICE');
-    const { system, user } = buildDistributedPracticePrompt(
-      systemPrompt,
-      dto.selectedText,
-      cardCount,
-    );
+    const { system, user } = buildDistributedPracticePrompt(systemPrompt, ctx.text, cardCount);
 
     let cards: FlashcardData[];
     let attempts = 0;
@@ -1215,7 +1310,7 @@ export class LearningInterventionsService {
         pageType: dto.pageType || null,
         type: 'DISTRIBUTED_PRACTICE',
         status: 'COMPLETED',
-        selectedText: dto.selectedText,
+        selectedText: ctx.text,
         completedAt: new Date(),
         sessionData: { cards: cards! } as unknown as Prisma.InputJsonValue,
       },
