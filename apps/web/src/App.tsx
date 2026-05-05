@@ -25,6 +25,8 @@ import { UserManagementPage } from './pages/teacher/UserManagementPage';
 import { StudentLogPage } from './pages/teacher/student-logs/StudentLogPage';
 import { SessionTimelinePage } from './pages/dashboard/SessionTimelinePage';
 import { StudentTextMiningPage } from './features/text-mining/pages/StudentTextMiningPage';
+import { EpisodePickerPage } from './pages/teacher/research/EpisodePickerPage';
+import { EpisodeTracePage } from './pages/teacher/research/EpisodeTracePage';
 import { ChangePassword } from './pages/ChangePassword';
 
 // Student pages
@@ -199,6 +201,23 @@ function App() {
                   element={
                     <RoleRoute allowedRoles={['teacher', 'admin']}>
                       <SessionTimelinePage />
+                    </RoleRoute>
+                  }
+                />
+                {/* Retrospective tracing (prompt_retro Stage 4) */}
+                <Route
+                  path="/teacher/research/courses/:courseId/students/:studentId/episodes"
+                  element={
+                    <RoleRoute allowedRoles={['teacher', 'admin']}>
+                      <EpisodePickerPage />
+                    </RoleRoute>
+                  }
+                />
+                <Route
+                  path="/teacher/research/episodes/:episodeId"
+                  element={
+                    <RoleRoute allowedRoles={['teacher', 'admin']}>
+                      <EpisodeTracePage />
                     </RoleRoute>
                   }
                 />
