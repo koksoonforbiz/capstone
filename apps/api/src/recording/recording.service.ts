@@ -1,4 +1,12 @@
-import { Injectable, Logger, NotFoundException, Inject, forwardRef } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  NotFoundException,
+  ForbiddenException,
+  BadRequestException,
+  Inject,
+  forwardRef,
+} from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { BlobService } from '../blob/blob.service';
 import { PyfeatService } from '../pyfeat/pyfeat.service';
@@ -74,6 +82,33 @@ export class RecordingService {
     studentId: string,
     dto: CreateSegmentDto,
   ): Promise<{ segmentId: string; uploadUrl: string; minioKey: string }> {
+    // SECURITY (cross-student leak hotfix): the client passes `sessionId`
+    // and `courseId`, but we MUST verify they belong to the requesting
+    // student. Otherwise a stale `sessionStorage['ats_session_id']` (e.g.
+    // shared classroom computer, race during logout cleanup) could land
+    // someone else's webcam segment in this user's session — and the
+    // teacher's retrospective-tracing view would then show another
+    // student's video. Confirmed in the wild: 2 mis-bound rows existed
+    // before this guard. Reject anything that doesn't match.
+    const session = await this.prisma.studentSession.findUnique({
+      where: { id: dto.sessionId },
+      select: { id: true, userId: true, courseId: true, endedAt: true },
+    });
+    if (!session) {
+      throw new NotFoundException('Session not found');
+    }
+    if (session.userId !== studentId) {
+      throw new ForbiddenException('Session does not belong to the requesting user');
+    }
+    if (session.courseId !== dto.courseId) {
+      throw new BadRequestException("courseId does not match the session's course");
+    }
+    if (session.endedAt) {
+      throw new BadRequestException(
+        'Session has already ended; refusing to attach a recording segment',
+      );
+    }
+
     const now = new Date(dto.startWallTime);
     const dateStr = now.toISOString().slice(0, 10); // YYYY-MM-DD
     const timeStr =
@@ -106,11 +141,21 @@ export class RecordingService {
     return { segmentId: segment.id, uploadUrl, minioKey };
   }
 
-  async completeSegment(segmentId: string, dto: CompleteSegmentDto): Promise<RecordingSegment> {
+  async completeSegment(
+    studentId: string,
+    segmentId: string,
+    dto: CompleteSegmentDto,
+  ): Promise<RecordingSegment> {
     const segment = await this.prisma.recordingSegment.findUnique({
       where: { id: segmentId },
     });
     if (!segment) throw new NotFoundException('Segment not found');
+    if (segment.studentId !== studentId) {
+      // Defense-in-depth — initiate now refuses cross-user attaches, but
+      // belt-and-braces in case a future code path ever creates segments
+      // with a wrong studentId.
+      throw new ForbiddenException('Segment does not belong to the requesting user');
+    }
 
     const updated = await this.prisma.recordingSegment.update({
       where: { id: segmentId },
@@ -182,7 +227,15 @@ export class RecordingService {
     return updated;
   }
 
-  async failSegment(segmentId: string, error: string): Promise<void> {
+  async failSegment(studentId: string, segmentId: string, error: string): Promise<void> {
+    const existing = await this.prisma.recordingSegment.findUnique({
+      where: { id: segmentId },
+      select: { studentId: true },
+    });
+    if (!existing) throw new NotFoundException('Segment not found');
+    if (existing.studentId !== studentId) {
+      throw new ForbiddenException('Segment does not belong to the requesting user');
+    }
     const segment = await this.prisma.recordingSegment.update({
       where: { id: segmentId },
       data: { uploadStatus: 'FAILED' },
