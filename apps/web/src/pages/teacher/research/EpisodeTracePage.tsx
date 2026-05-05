@@ -1,0 +1,413 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
+import type { Resolution, TimelinePayload } from '@ats/shared';
+import { api, ApiError } from '../../../lib/api';
+import { useTimelineState } from '../../../hooks/useTimelineState';
+import { StitchedVideoPlayer } from '../../../components/research/StitchedVideoPlayer';
+import { TimelineRuler } from '../../../components/research/TimelineRuler';
+
+/**
+ * Retrospective tracing — the page where a researcher actually inspects an
+ * episode. Stage 4 builds the shell: header, video player, master timeline
+ * ruler, refresh-gap markers. Lanes + inspector arrive in Stage 5.
+ */
+
+const RESOLUTION_OPTIONS: { value: Resolution; label: string }[] = [
+  { value: 'low', label: 'Low (5s buckets)' },
+  { value: 'medium', label: 'Medium (1s buckets)' },
+  { value: 'high', label: 'High (200ms buckets)' },
+  { value: 'raw', label: 'Raw (no bucketing)' },
+];
+
+export function EpisodeTracePage() {
+  const { episodeId } = useParams<{ episodeId: string }>();
+  const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+
+  const [payload, setPayload] = useState<TimelinePayload | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [resolution, setResolution] = useState<Resolution>(
+    (searchParams.get('res') as Resolution) || 'medium',
+  );
+
+  // ─── Fetch timeline ───────────────────────────────────────────────────
+  useEffect(() => {
+    if (!episodeId) return;
+    let cancelled = false;
+    setIsLoading(true);
+    setError(null);
+
+    api
+      .get<TimelinePayload>(`/research/episodes/${episodeId}/timeline?resolution=${resolution}`)
+      .then((data) => {
+        if (cancelled) return;
+        // Server-side response is contract-enforced via @ats/shared types
+        // (Stage 3 controller). We don't re-parse with Zod on the frontend
+        // to keep the bundle slim — rollup struggles with the CJS shared
+        // package's runtime exports, and the static types are sufficient.
+        setPayload(data);
+        setIsLoading(false);
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        const msg = e instanceof ApiError ? e.message : (e as Error)?.message || 'Unknown error';
+        setError(msg);
+        setIsLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [episodeId, resolution]);
+
+  if (isLoading) {
+    return <SkeletonPage />;
+  }
+
+  if (error) {
+    return (
+      <div className="p-6 max-w-4xl mx-auto">
+        <div className="border border-red-200 bg-red-50 dark:bg-red-950/30 dark:border-red-900 rounded p-4 text-sm text-red-700 dark:text-red-300">
+          <div className="font-medium mb-1">Failed to load episode</div>
+          <div className="text-xs opacity-80">{error}</div>
+          <div className="mt-3 flex gap-2">
+            <button
+              type="button"
+              onClick={() => setResolution((r) => r)}
+              className="text-xs px-2 py-1 border border-red-300 rounded hover:bg-red-100"
+            >
+              Retry
+            </button>
+            <button
+              type="button"
+              onClick={() => navigate(-1)}
+              className="text-xs px-2 py-1 border border-stone-300 rounded hover:bg-stone-100 dark:hover:bg-stone-800"
+            >
+              Back
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!payload) return null;
+
+  return (
+    <EpisodeTraceContent
+      payload={payload}
+      resolution={resolution}
+      onResolutionChange={(r) => {
+        setResolution(r);
+        const next = new URLSearchParams(searchParams);
+        next.set('res', r);
+        setSearchParams(next, { replace: true });
+      }}
+    />
+  );
+}
+
+// ─── Inner content (separated so the timeline state hook only mounts once
+//     payload is loaded — episode data is required for derived state) ────
+function EpisodeTraceContent({
+  payload,
+  resolution,
+  onResolutionChange,
+}: {
+  payload: TimelinePayload;
+  resolution: Resolution;
+  onResolutionChange: (r: Resolution) => void;
+}) {
+  const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+
+  const ts = useTimelineState(payload.episode);
+  const episodeStartedAt = useMemo(
+    () => new Date(payload.episode.startedAt),
+    [payload.episode.startedAt],
+  );
+  const episodeDurationMs = payload.episode.durationMs ?? 0;
+
+  // ─── URL state hydration (once on mount) ───────────────────────────────
+  const hydratedRef = useRef(false);
+  useEffect(() => {
+    if (hydratedRef.current) return;
+    hydratedRef.current = true;
+    const t = parseInt(searchParams.get('t') ?? '', 10);
+    const z = parseInt(searchParams.get('zoom') ?? '', 10);
+    const p = parseInt(searchParams.get('pan') ?? '', 10);
+    if (Number.isFinite(t) && t >= 0) ts.setCurrentMs(t);
+    if (Number.isFinite(z) && z > 0) ts.setZoomMs(z);
+    if (Number.isFinite(p) && p >= 0) ts.setPanMs(p);
+    // Intentionally only on mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ─── URL state sync (debounced 300ms) ─────────────────────────────────
+  useEffect(() => {
+    const handle = window.setTimeout(() => {
+      const next = new URLSearchParams(searchParams);
+      next.set('t', Math.round(ts.currentMs).toString());
+      next.set('zoom', Math.round(ts.zoomMs).toString());
+      next.set('pan', Math.round(ts.panMs).toString());
+      next.set('res', resolution);
+      setSearchParams(next, { replace: true });
+    }, 300);
+    return () => window.clearTimeout(handle);
+    // searchParams/setSearchParams are stable enough; we only need to react
+    // to time/zoom/pan changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ts.currentMs, ts.zoomMs, ts.panMs, resolution]);
+
+  const onSeek = useCallback(
+    (ms: number) => {
+      ts.setCurrentMs(ms);
+    },
+    [ts],
+  );
+
+  const groupingLabel = useMemo(() => {
+    const m = payload.episode.groupingMethod.replace(/_/g, ' ');
+    if (
+      payload.episode.groupingMethod === 'auto_heuristic' &&
+      payload.episode.groupingConfidence !== null
+    ) {
+      return `${m} ${Math.round(payload.episode.groupingConfidence * 100)}%`;
+    }
+    return m;
+  }, [payload.episode.groupingMethod, payload.episode.groupingConfidence]);
+
+  return (
+    <div className="flex flex-col h-full min-h-screen bg-stone-50 dark:bg-stone-950">
+      {/* Header */}
+      <header className="px-6 py-3 bg-white dark:bg-stone-900 border-b border-stone-200 dark:border-stone-700 flex items-center gap-4">
+        <button
+          type="button"
+          onClick={() => navigate(-1)}
+          className="text-xs text-stone-600 hover:text-stone-900 dark:text-stone-300 px-2 py-1 border border-stone-300 dark:border-stone-700 rounded hover:bg-stone-50 dark:hover:bg-stone-800"
+        >
+          ← Back
+        </button>
+        <div className="min-w-0">
+          <h1 className="text-sm font-semibold text-stone-900 dark:text-stone-100 truncate">
+            Episode <span className="font-mono">{payload.episode.id.slice(0, 8)}</span>
+          </h1>
+          <div className="text-xs text-stone-500 truncate">
+            {episodeStartedAt.toLocaleString()}
+            <span className="mx-1.5">·</span>
+            {formatDuration(episodeDurationMs)}
+            <span className="mx-1.5">·</span>
+            {payload.episode.sessionCount}{' '}
+            {payload.episode.sessionCount === 1 ? 'session' : 'sessions'}
+            <span className="mx-1.5">·</span>
+            <span className="capitalize">{groupingLabel}</span>
+          </div>
+        </div>
+
+        <div className="ml-auto flex items-center gap-2 text-xs">
+          <label className="flex items-center gap-1.5">
+            <span className="text-stone-500">Resolution</span>
+            <select
+              value={resolution}
+              onChange={(e) => onResolutionChange(e.target.value as Resolution)}
+              className="border border-stone-300 dark:border-stone-700 rounded px-2 py-1 bg-white dark:bg-stone-900"
+            >
+              {RESOLUTION_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          {/* Stage-6 stub */}
+          <button
+            type="button"
+            disabled
+            title="Export — coming in Stage 6"
+            className="px-2 py-1 border border-stone-300 dark:border-stone-700 rounded opacity-50 cursor-not-allowed bg-white dark:bg-stone-900"
+          >
+            Export ▾
+          </button>
+        </div>
+      </header>
+
+      {/* Body */}
+      <div className="flex-1 px-6 py-4 grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_320px] gap-4">
+        {/* Left: video + ruler */}
+        <div className="flex flex-col gap-4 min-w-0">
+          <StitchedVideoPlayer
+            segments={payload.video.segments}
+            episodeDurationMs={episodeDurationMs}
+            currentMs={ts.currentMs}
+            onTimeUpdate={(ms) => ts.setCurrentMs(ms)}
+            onSeek={onSeek}
+            playing={ts.playing}
+            onPlayingChange={ts.setPlaying}
+            playbackRate={ts.playbackRate}
+            onPlaybackRateChange={ts.setPlaybackRate}
+          />
+
+          {/* Ruler + zoom controls */}
+          <section aria-label="Timeline ruler" className="space-y-2">
+            <div className="flex items-center gap-2 text-xs text-stone-500">
+              <span>Timeline</span>
+              <span>·</span>
+              <span>
+                Visible window: {formatDuration(ts.zoomMs)} of {formatDuration(episodeDurationMs)}
+              </span>
+              <div className="ml-auto flex gap-1">
+                <button
+                  type="button"
+                  onClick={() => ts.setZoomMs(Math.max(1000, ts.zoomMs / 2))}
+                  className="px-2 py-0.5 border border-stone-300 dark:border-stone-700 rounded hover:bg-stone-50 dark:hover:bg-stone-800"
+                  aria-label="Zoom in"
+                >
+                  +
+                </button>
+                <button
+                  type="button"
+                  onClick={() => ts.setZoomMs(Math.min(episodeDurationMs, ts.zoomMs * 2))}
+                  className="px-2 py-0.5 border border-stone-300 dark:border-stone-700 rounded hover:bg-stone-50 dark:hover:bg-stone-800"
+                  aria-label="Zoom out"
+                >
+                  −
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    ts.setZoomMs(episodeDurationMs);
+                    ts.setPanMs(0);
+                  }}
+                  className="px-2 py-0.5 border border-stone-300 dark:border-stone-700 rounded hover:bg-stone-50 dark:hover:bg-stone-800"
+                  aria-label="Fit"
+                >
+                  Fit
+                </button>
+              </div>
+            </div>
+
+            <TimelineRuler
+              episodeStartedAt={episodeStartedAt}
+              episodeDurationMs={episodeDurationMs}
+              currentMs={ts.currentMs}
+              onSeek={onSeek}
+              zoomMs={ts.zoomMs}
+              onZoomChange={ts.setZoomMs}
+              panMs={ts.panMs}
+              onPanChange={ts.setPanMs}
+              sessionBoundaries={payload.sessionBoundaries}
+            />
+
+            {payload.meta.downsampledLanes.length > 0 && (
+              <div className="text-[11px] text-stone-500 italic">
+                Downsampled lanes at {resolution}: {payload.meta.downsampledLanes.join(', ')}
+              </div>
+            )}
+            {payload.meta.truncatedLanes.length > 0 && (
+              <div className="text-[11px] text-amber-600 dark:text-amber-400">
+                Truncated:{' '}
+                {payload.meta.truncatedLanes.map((t) => `${t.lane} (${t.capHit})`).join(', ')}
+              </div>
+            )}
+          </section>
+
+          {/* Lanes — Stage 5 placeholder */}
+          <section
+            aria-label="Lanes (Stage 5)"
+            className="border border-dashed border-stone-300 dark:border-stone-700 rounded p-6 text-center text-sm text-stone-400 dark:text-stone-500"
+          >
+            Lanes (gaze, pupil, AUs, emotion, click, scroll, …) arrive in Stage 5.
+          </section>
+        </div>
+
+        {/* Right: inspector placeholder (Stage 5) */}
+        <aside className="hidden xl:block">
+          <div className="sticky top-4 border border-stone-200 dark:border-stone-700 rounded p-4 bg-white dark:bg-stone-900 text-xs text-stone-500 space-y-2">
+            <div className="font-medium text-stone-700 dark:text-stone-200">Inspector</div>
+            <div>
+              <div className="text-stone-400 mb-0.5">Episode</div>
+              <code className="text-[10px]">{payload.episode.id}</code>
+            </div>
+            <div>
+              <div className="text-stone-400 mb-0.5">Sessions</div>
+              <ul className="space-y-1">
+                {payload.sessionBoundaries.map((b) => (
+                  <li
+                    key={b.sessionId}
+                    className="flex items-center justify-between text-[11px] hover:text-stone-700 dark:hover:text-stone-200 cursor-pointer"
+                    onClick={() => onSeek(b.sessionStartMs)}
+                  >
+                    <code className="font-mono">{b.sessionId.slice(0, 8)}</code>
+                    <span className="font-mono tabular-nums">
+                      +{formatDuration(b.sessionStartMs)}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+            <div className="pt-2 border-t border-stone-200 dark:border-stone-700">
+              <div className="text-stone-400 mb-0.5">Video segments</div>
+              <div className="font-mono tabular-nums">
+                {payload.video.segments.length} · {formatDuration(payload.video.totalDurationMs)}{' '}
+                total
+              </div>
+            </div>
+            <div className="pt-2 border-t border-stone-200 dark:border-stone-700 italic text-stone-400">
+              Per-tick lane values appear here in Stage 5.
+            </div>
+          </div>
+
+          <div className="mt-3 text-[11px] text-stone-400">
+            <Link
+              to={`/teacher/research/courses/${payload.episode.courseId}/students/${payload.episode.userId}/episodes`}
+              className="hover:text-stone-700 dark:hover:text-stone-200"
+            >
+              ← Back to episodes for this student
+            </Link>
+          </div>
+        </aside>
+      </div>
+    </div>
+  );
+}
+
+// ─── Skeleton ────────────────────────────────────────────────────────────
+
+function SkeletonPage() {
+  return (
+    <div className="flex flex-col min-h-screen bg-stone-50 dark:bg-stone-950">
+      <header className="px-6 py-3 border-b border-stone-200 dark:border-stone-700 bg-white dark:bg-stone-900">
+        <div className="h-5 w-48 bg-stone-200 dark:bg-stone-800 rounded animate-pulse" />
+        <div className="h-3 w-72 bg-stone-200 dark:bg-stone-800 rounded animate-pulse mt-1.5" />
+      </header>
+      <div className="flex-1 px-6 py-4 grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_320px] gap-4">
+        <div className="flex flex-col gap-4">
+          <div className="aspect-video w-full max-w-[1280px] bg-stone-200 dark:bg-stone-800 rounded-lg animate-pulse" />
+          <div className="h-14 w-full bg-stone-200 dark:bg-stone-800 rounded animate-pulse" />
+          <div className="h-32 w-full bg-stone-100 dark:bg-stone-800/60 rounded animate-pulse" />
+        </div>
+        <div className="hidden xl:block">
+          <div className="h-64 w-full bg-stone-200 dark:bg-stone-800 rounded animate-pulse" />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────
+
+function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return '0:00';
+  const total = Math.floor(ms / 1000);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) return `${h}:${pad(m)}:${pad(s)}`;
+  return `${m}:${pad(s)}`;
+}
+
+function pad(n: number): string {
+  return n.toString().padStart(2, '0');
+}
