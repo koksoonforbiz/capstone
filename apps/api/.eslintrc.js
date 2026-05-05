@@ -5,5 +5,7 @@ module.exports = {
     tsconfigRootDir: __dirname,
     sourceType: 'module',
   },
-  ignorePatterns: ['dist', 'node_modules', '.eslintrc.js'],
+  // `scripts/` is intentionally outside src/ (one-off CLI utilities) so it's
+  // not part of the type-aware tsconfig — exclude from lint as well.
+  ignorePatterns: ['dist', 'node_modules', '.eslintrc.js', 'scripts'],
 };
