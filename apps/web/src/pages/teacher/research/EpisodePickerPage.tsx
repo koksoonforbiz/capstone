@@ -259,6 +259,7 @@ export function EpisodePickerPage() {
                 <tr
                   key={ep.id}
                   className="hover:bg-stone-50 dark:hover:bg-stone-900/60 cursor-pointer"
+                  title={ep.notes ?? undefined}
                   onClick={() => navigate(`/teacher/research/episodes/${ep.id}`)}
                 >
                   <td className="px-3 py-2 whitespace-nowrap font-mono tabular-nums text-stone-700 dark:text-stone-200">
@@ -292,6 +293,15 @@ export function EpisodePickerPage() {
                   </td>
                   <td className="px-3 py-2">
                     <GroupingBadge method={ep.groupingMethod} confidence={ep.groupingConfidence} />
+                    {ep.notes && (
+                      <span
+                        className="ml-1 text-stone-400"
+                        title={ep.notes}
+                        aria-label={`Notes: ${ep.notes}`}
+                      >
+                        ✎
+                      </span>
+                    )}
                   </td>
                   <td className="px-3 py-2 text-right">
                     <Link
