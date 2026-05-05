@@ -48,8 +48,22 @@ export class SessionService {
     return session.id;
   }
 
-  /** Associate a courseId with an existing session (idempotent). */
-  async setCourseId(sessionId: string, courseId: string): Promise<void> {
+  /**
+   * Associate a courseId with an existing session (idempotent).
+   *
+   * Accepts an optional `clientEpisodeId` because login → /session/open
+   * happens BEFORE the student picks a course, so the original openSession
+   * call had no courseId and skipped episode grouping. The frontend's
+   * subsequent /session/course PATCH is the first request that has both a
+   * session AND a course, so it's where the client-provided UUID actually
+   * gets used to group. Without this forward, the heuristic would always
+   * win on the login → enter-course path.
+   */
+  async setCourseId(
+    sessionId: string,
+    courseId: string,
+    opts?: { clientEpisodeId?: string },
+  ): Promise<void> {
     const session = await this.prisma.studentSession.update({
       where: { id: sessionId },
       data: { courseId },
@@ -64,6 +78,7 @@ export class SessionService {
         startedAt: session.startedAt,
         userAgent: session.userAgent,
         ipAddress: session.ipAddress,
+        clientEpisodeId: opts?.clientEpisodeId,
       });
     }
     this.logger.log(`Session ${sessionId} linked to course ${courseId}`);

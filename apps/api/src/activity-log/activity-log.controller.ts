@@ -99,12 +99,24 @@ export class ActivityLogController {
    * Called by the frontend when a student navigates to a course page.
    * Associates the current activity session with a courseId so the teacher
    * can view biometric data in the session log viewer.
+   *
+   * Also reads X-Learning-Episode-Id (Stage 2 of prompt_retro). When a
+   * student logs in without a course context, the original /session/open
+   * call has no courseId so SessionService skips episode grouping. This
+   * is the first request that has both a session AND a courseId, so
+   * it's where the clientEpisodeId actually gets used to group.
    */
   @Patch('session/course')
   @Roles('student')
-  async setSessionCourse(@SessionId() sessionId: string, @Body() body: { courseId: string }) {
+  async setSessionCourse(
+    @SessionId() sessionId: string,
+    @Body() body: { courseId: string },
+    @Request() req: { headers?: Record<string, string | undefined> },
+  ) {
     if (sessionId && body.courseId) {
-      await this.sessionService.setCourseId(sessionId, body.courseId);
+      const headers = req.headers ?? {};
+      const clientEpisodeId = headers['x-learning-episode-id'] ?? headers['X-Learning-Episode-Id'];
+      await this.sessionService.setCourseId(sessionId, body.courseId, { clientEpisodeId });
     }
     return { ok: true };
   }
