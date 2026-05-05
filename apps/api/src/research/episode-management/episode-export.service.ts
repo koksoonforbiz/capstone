@@ -2,7 +2,9 @@ import { randomUUID } from 'crypto';
 import { ForbiddenException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
+  CreateBucketCommand,
   GetObjectCommand,
+  HeadBucketCommand,
   ListObjectsV2Command,
   PutObjectCommand,
   S3Client,
@@ -83,6 +85,44 @@ export class EpisodeExportService {
     this.bucket = config.get<string>('MINIO_LOG_BUCKET', 'student-logs');
   }
 
+  // ─── Bucket bootstrap ───────────────────────────────────────────────────
+
+  /** Lazily create the `MINIO_LOG_BUCKET` if it doesn't exist yet. The
+   *  hotfix that uncovered this: the bucket was never provisioned in dev
+   *  so every export was failing with NoSuchBucket. Mirrors BlobService's
+   *  ensureBucket pattern. Idempotent + cheap — single HeadBucket call. */
+  private bucketReadyPromise: Promise<void> | null = null;
+  private ensureBucket(): Promise<void> {
+    if (!this.bucketReadyPromise) {
+      this.bucketReadyPromise = (async () => {
+        try {
+          await this.s3.send(new HeadBucketCommand({ Bucket: this.bucket }));
+        } catch (err: unknown) {
+          const status =
+            (err as { $metadata?: { httpStatusCode?: number } })?.$metadata?.httpStatusCode ?? 0;
+          if (status === 404 || status === 403) {
+            this.logger.log(`Creating MinIO bucket "${this.bucket}" (was missing).`);
+            try {
+              await this.s3.send(new CreateBucketCommand({ Bucket: this.bucket }));
+            } catch (createErr: unknown) {
+              // Another concurrent createExport may have created it — re-head.
+              try {
+                await this.s3.send(new HeadBucketCommand({ Bucket: this.bucket }));
+              } catch {
+                this.bucketReadyPromise = null; // allow retry next time
+                throw createErr;
+              }
+            }
+          } else {
+            this.bucketReadyPromise = null;
+            throw err;
+          }
+        }
+      })();
+    }
+    return this.bucketReadyPromise;
+  }
+
   // ─── Create export ──────────────────────────────────────────────────────
 
   async createExport(
@@ -94,6 +134,7 @@ export class EpisodeExportService {
     if (!['csv', 'jsonl'].includes(input.format)) {
       throw new Error(`Invalid format: ${input.format}`);
     }
+    await this.ensureBucket();
     const episode = await this.loadEpisodeOwned(actorUserId, actorRole, episodeId);
 
     // Always pull at raw resolution — exports should not silently downsample.
@@ -271,6 +312,7 @@ export class EpisodeExportService {
     }>
   > {
     await this.loadEpisodeOwned(actorUserId, actorRole, episodeId);
+    await this.ensureBucket();
 
     const prefix = `log-exports/episodes/${episodeId}/`;
     const list = await this.s3.send(

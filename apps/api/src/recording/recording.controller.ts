@@ -41,14 +41,22 @@ export class RecordingController {
 
   @Patch('segments/:segmentId/complete')
   @Roles('student')
-  completeSegment(@Param('segmentId') segmentId: string, @Body() dto: CompleteSegmentDto) {
-    return this.recordingService.completeSegment(segmentId, dto);
+  completeSegment(
+    @Request() req: { user: RequestUser },
+    @Param('segmentId') segmentId: string,
+    @Body() dto: CompleteSegmentDto,
+  ) {
+    return this.recordingService.completeSegment(req.user.id, segmentId, dto);
   }
 
   @Patch('segments/:segmentId/fail')
   @Roles('student')
-  failSegment(@Param('segmentId') segmentId: string, @Body() body: { error: string }) {
-    return this.recordingService.failSegment(segmentId, body.error);
+  failSegment(
+    @Request() req: { user: RequestUser },
+    @Param('segmentId') segmentId: string,
+    @Body() body: { error: string },
+  ) {
+    return this.recordingService.failSegment(req.user.id, segmentId, body.error);
   }
 
   // ─── Segments (teacher) ───────────────────────────────
