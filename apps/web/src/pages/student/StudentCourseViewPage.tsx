@@ -3,6 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { apiFetch } from '../../lib/api';
 import { useToast } from '../../components/Toast';
 import { usePageContext } from '../../contexts/PageContext';
+import { useLearningEpisode } from '../../hooks/useLearningEpisode';
 import BlockRenderer from '../../components/editor/BlockRenderer';
 
 interface ModuleItem {
@@ -39,6 +40,12 @@ export function StudentCourseViewPage() {
   const { courseId } = useParams<{ courseId: string }>();
   const navigate = useNavigate();
   const { toast } = useToast();
+
+  // Mint / refresh the learning-episode ID for this course context
+  // (prompt_retro Stage 2). Return value is unused — the hook persists the
+  // ID to localStorage where api.ts picks it up for the X-Learning-Episode-Id
+  // header on every subsequent request.
+  useLearningEpisode(courseId);
 
   const { setPageContext } = usePageContext();
   const [course, setCourse] = useState<Course | null>(null);

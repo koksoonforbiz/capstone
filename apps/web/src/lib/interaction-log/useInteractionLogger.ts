@@ -1,5 +1,6 @@
 import { useEffect, useRef, useCallback } from 'react';
 import { api } from '../api';
+import { touchEpisodeActivity } from '../learning-episode';
 
 const API_BASE = '/api';
 const FLUSH_INTERVAL_MS = 30_000;
@@ -119,6 +120,11 @@ export function useInteractionLogger({
 
   const flushAll = useCallback(
     async (useBeacon = false) => {
+      // Activity-driven heartbeat (prompt_retro Stage 2). The 30-second
+      // interaction batch is the most reliable "user is actively here"
+      // signal, so refresh the learning-episode timestamp here instead of
+      // relying on React re-render frequency.
+      touchEpisodeActivity();
       await Promise.all([
         flush('/logs/cursor', cursorBuffer, useBeacon),
         flush('/logs/clicks', clickBuffer, useBeacon),

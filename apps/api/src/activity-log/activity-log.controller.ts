@@ -44,9 +44,21 @@ export class ActivityLogController {
    */
   @Post('session/open')
   @Roles('student')
-  async openSession(@Request() req: { user: RequestUser }) {
+  async openSession(
+    @Request()
+    req: {
+      user: RequestUser;
+      headers?: Record<string, string | undefined>;
+      ip?: string;
+    },
+  ) {
+    const headers = req.headers ?? {};
     const sessionId = await this.sessionService.openSession({
       userId: req.user.id,
+      ipAddress: req.ip,
+      userAgent: headers['user-agent'],
+      // Express lowercases header names; check both for safety in tests.
+      clientEpisodeId: headers['x-learning-episode-id'] ?? headers['X-Learning-Episode-Id'],
     });
     return { sessionId };
   }

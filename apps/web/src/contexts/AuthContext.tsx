@@ -2,6 +2,7 @@ import { createContext, useContext, useState, useEffect, useCallback, type React
 import { api } from '../lib/api';
 import { joinStudentRoom, disconnectSocket } from '../lib/socket';
 import { initActivitySession, clearActivitySession } from '../lib/activity-log';
+import { clearEpisodeId } from '../lib/learning-episode';
 import { mediaStreamRegistry } from '../lib/biometrics/mediaStreamRegistry';
 import type { UserRole } from '@ats/shared';
 
@@ -96,6 +97,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const login = useCallback(async (email: string, password: string) => {
+    // Drop any stale learning-episode ID before we know which course this
+    // login will land in. The course-entry route's useLearningEpisode hook
+    // will mint a fresh one (or attach to a still-valid stored one if the
+    // user reloaded straight back into the same course within 30 min).
+    clearEpisodeId();
+
     const response = await api.post<AuthResponse | PasswordChangeResponse>('/auth/login', {
       email,
       password,
@@ -160,6 +167,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }).catch(() => {});
     }
     clearActivitySession();
+    clearEpisodeId();
 
     // Stop all active webcam/media streams before clearing auth
     // NOTE: keep token in localStorage during cleanup so that async
