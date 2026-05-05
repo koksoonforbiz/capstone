@@ -247,6 +247,18 @@ export class RagController {
     return this.llmService.getUserLlmSettings(req.user.id);
   }
 
+  @Get('llm-settings/available-models')
+  @Roles('teacher', 'admin')
+  async getAvailableModels(
+    @Request() req: { user: RequestUser },
+    @Query('provider') provider: string,
+  ) {
+    if (provider !== 'openai' && provider !== 'gemini') {
+      throw new BadRequestException(`Unsupported provider "${provider}". Use openai or gemini.`);
+    }
+    return this.llmService.listAvailableModels(req.user.id, provider);
+  }
+
   @Post('llm-settings')
   @Roles('teacher', 'admin')
   async saveLlmSettings(

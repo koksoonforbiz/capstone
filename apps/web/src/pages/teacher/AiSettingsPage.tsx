@@ -8,20 +8,15 @@ interface LlmSettings {
   hasKey: boolean;
 }
 
-const PROVIDER_MODELS: Record<string, { value: string; label: string }[]> = {
-  openai: [
-    { value: 'gpt-4o-mini', label: 'GPT-4o Mini (cheapest, fast)' },
-    { value: 'gpt-4o', label: 'GPT-4o (best quality)' },
-    { value: 'gpt-4-turbo', label: 'GPT-4 Turbo' },
-    { value: 'gpt-3.5-turbo', label: 'GPT-3.5 Turbo (legacy, cheapest)' },
-  ],
-  gemini: [
-    { value: 'gemini-2.0-flash', label: 'Gemini 2.0 Flash (fast, recommended)' },
-    { value: 'gemini-2.0-flash-lite', label: 'Gemini 2.0 Flash Lite (cheapest)' },
-    { value: 'gemini-2.5-flash-preview-05-20', label: 'Gemini 2.5 Flash (preview, best quality)' },
-    { value: 'gemini-2.5-pro-preview-05-06', label: 'Gemini 2.5 Pro (preview, most capable)' },
-  ],
-};
+interface ModelOption {
+  value: string;
+  label: string;
+}
+
+interface AvailableModelsResponse {
+  models: ModelOption[];
+  source: 'live' | 'fallback';
+}
 
 const PROVIDER_KEY_HELP: Record<string, { placeholder: string; url: string; label: string }> = {
   openai: {
@@ -53,6 +48,14 @@ export function AiSettingsPage() {
   const [saving, setSaving] = useState(false);
   const [showKey, setShowKey] = useState(false);
 
+  // Available models for the current provider, fetched from the backend so
+  // the list stays in sync with what the provider actually accepts (Google
+  // retires preview model IDs every few months — the previous hardcoded list
+  // had 4-of-5 dead Gemini entries).
+  const [availableModels, setAvailableModels] = useState<ModelOption[]>([]);
+  const [modelsSource, setModelsSource] = useState<'live' | 'fallback' | null>(null);
+  const [modelsLoading, setModelsLoading] = useState(false);
+
   useEffect(() => {
     (async () => {
       try {
@@ -67,6 +70,34 @@ export function AiSettingsPage() {
       }
     })();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Refresh the model list whenever the chosen provider changes.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setModelsLoading(true);
+      try {
+        const data = await apiFetch<AvailableModelsResponse>(
+          `/llm-settings/available-models?provider=${encodeURIComponent(provider)}`,
+        );
+        if (cancelled) return;
+        setAvailableModels(data.models);
+        setModelsSource(data.source);
+        // If the currently selected model isn't in the new list, jump to the
+        // first option so the dropdown doesn't show a stale value as selected.
+        if (data.models.length > 0 && !data.models.some((m) => m.value === model)) {
+          setModel(data.models[0]!.value);
+        }
+      } catch {
+        if (!cancelled) setModelsSource('fallback');
+      } finally {
+        if (!cancelled) setModelsLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [provider]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -115,9 +146,7 @@ export function AiSettingsPage() {
       {/* Current Status */}
       <div
         className={`p-4 rounded-lg border mb-6 ${
-          settings?.hasKey
-            ? 'bg-green-50 border-green-200'
-            : 'bg-yellow-50 border-yellow-200'
+          settings?.hasKey ? 'bg-green-50 border-green-200' : 'bg-yellow-50 border-yellow-200'
         }`}
       >
         <div className="flex items-center gap-2">
@@ -138,8 +167,8 @@ export function AiSettingsPage() {
         </div>
         {!settings?.hasKey && (
           <p className="text-xs text-yellow-700 mt-2">
-            Without an API key, the Course Studio will use template-based content generation.
-            To use real AI, enter your API key below.
+            Without an API key, the Course Studio will use template-based content generation. To use
+            real AI, enter your API key below.
           </p>
         )}
       </div>
@@ -163,22 +192,40 @@ export function AiSettingsPage() {
         </div>
 
         <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">Model</label>
+          <label className="block text-sm font-medium text-gray-700 mb-1">
+            Model
+            {modelsLoading && <span className="ml-2 text-xs text-gray-400">(loading…)</span>}
+            {modelsSource === 'live' && !modelsLoading && (
+              <span className="ml-2 text-[10px] uppercase tracking-wide text-green-700 bg-green-100 px-1.5 py-0.5 rounded">
+                live
+              </span>
+            )}
+            {modelsSource === 'fallback' && !modelsLoading && (
+              <span
+                className="ml-2 text-[10px] uppercase tracking-wide text-amber-700 bg-amber-100 px-1.5 py-0.5 rounded"
+                title="Backend couldn't reach the provider's models endpoint (no key, network, or HTTP error). Showing the verified-good static list instead."
+              >
+                fallback
+              </span>
+            )}
+          </label>
           <select
             value={model}
             onChange={(e) => setModel(e.target.value)}
             className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
           >
-            {(PROVIDER_MODELS[provider] || []).map((m) => (
+            {availableModels.map((m) => (
               <option key={m.value} value={m.value}>
                 {m.label}
               </option>
             ))}
           </select>
           <p className="text-xs text-gray-400 mt-1">
-            {provider === 'gemini'
-              ? 'Gemini 2.0 Flash is recommended for a balance of cost and quality.'
-              : 'GPT-4o Mini is recommended for a balance of cost and quality.'}
+            {modelsSource === 'live'
+              ? 'List fetched from the provider — every option here will accept generation requests with your saved key.'
+              : provider === 'gemini'
+                ? 'Gemini 2.0 Flash is recommended for a balance of cost and quality.'
+                : 'GPT-4o Mini is recommended for a balance of cost and quality.'}
           </p>
         </div>
 
@@ -191,7 +238,11 @@ export function AiSettingsPage() {
               type={showKey ? 'text' : 'password'}
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
-              placeholder={settings?.hasKey ? 'Enter new key to replace...' : (PROVIDER_KEY_HELP[provider]?.placeholder || 'Enter API key...')}
+              placeholder={
+                settings?.hasKey
+                  ? 'Enter new key to replace...'
+                  : PROVIDER_KEY_HELP[provider]?.placeholder || 'Enter API key...'
+              }
               className="w-full px-3 py-2 pr-20 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 font-mono text-sm"
               required={!settings?.hasKey}
             />
