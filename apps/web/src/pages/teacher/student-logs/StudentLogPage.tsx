@@ -38,7 +38,12 @@ export function StudentLogPage() {
           <h2 className="text-sm font-medium text-gray-900 dark:text-gray-100">Sessions</h2>
           <p className="text-xs text-gray-500 mt-0.5">{sessions.length} total</p>
         </div>
-        <SessionList sessions={sessions} selectedId={selectedSessionId} onSelect={selectSession} />
+        <SessionList
+          sessions={sessions}
+          selectedId={selectedSessionId}
+          onSelect={selectSession}
+          studentId={studentId}
+        />
       </div>
 
       {/* Right panel — log viewer */}
