@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import type { Resolution, TimelinePayload } from '@ats/shared';
 import { api, ApiError } from '../../../lib/api';
 import { useTimelineState } from '../../../hooks/useTimelineState';
+import { useLaneConfig } from '../../../hooks/useLaneConfig';
 import { StitchedVideoPlayer } from '../../../components/research/StitchedVideoPlayer';
 import { TimelineRuler } from '../../../components/research/TimelineRuler';
+import { LaneContainer, type SelectedEventKind } from '../../../components/research/LaneContainer';
+import { InspectorPanel, type SelectedEvent } from '../../../components/research/InspectorPanel';
 
 /**
  * Retrospective tracing — the page where a researcher actually inspects an
@@ -167,6 +170,40 @@ function EpisodeTraceContent({
     [ts],
   );
 
+  // ─── Stage 5: lane config, selected event, gaze mode, inspector collapse ─
+  const { config: laneConfig, setVisible, setHeight, moveLane } = useLaneConfig();
+  const [selectedEvent, setSelectedEvent] = useState<SelectedEvent | null>(null);
+  const [gazeMode, setGazeMode] = useState<'trace' | 'density'>('trace');
+  const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
+
+  // Click-to-jump on any lane marker: pause + seek + ensure visible window.
+  const handleSelectEvent = useCallback(
+    (kind: SelectedEventKind, eventPayload: unknown, tMs: number) => {
+      ts.setPlaying(false);
+      ts.setCurrentMs(tMs);
+
+      // Recenter the visible window if tMs is currently outside it.
+      const inWindow = tMs >= ts.panMs && tMs <= ts.panMs + ts.zoomMs;
+      if (!inWindow) {
+        const halfZoom = ts.zoomMs / 2;
+        const desiredPan = Math.max(0, Math.min(episodeDurationMs - ts.zoomMs, tMs - halfZoom));
+        ts.setPanMs(Math.max(0, desiredPan));
+      }
+
+      setSelectedEvent({ kind, tMs, payload: eventPayload });
+    },
+    [ts, episodeDurationMs],
+  );
+
+  const selectedEventDomId = useMemo(() => {
+    if (!selectedEvent) return null;
+    const p = selectedEvent.payload as { messageId?: string; constructKey?: string };
+    if (selectedEvent.kind === 'efDetection' && p.messageId && p.constructKey) {
+      return `ef-${p.messageId}-${p.constructKey}`;
+    }
+    return null;
+  }, [selectedEvent]);
+
   const groupingLabel = useMemo(() => {
     const m = payload.episode.groupingMethod.replace(/_/g, ' ');
     if (
@@ -234,7 +271,13 @@ function EpisodeTraceContent({
       </header>
 
       {/* Body */}
-      <div className="flex-1 px-6 py-4 grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_320px] gap-4">
+      <div
+        className={`flex-1 px-6 py-4 grid grid-cols-1 ${
+          inspectorCollapsed
+            ? 'xl:grid-cols-[minmax(0,1fr)_3rem]'
+            : 'xl:grid-cols-[minmax(0,1fr)_360px]'
+        } gap-4`}
+      >
         {/* Left: video + ruler */}
         <div className="flex flex-col gap-4 min-w-0">
           <StitchedVideoPlayer
@@ -313,59 +356,39 @@ function EpisodeTraceContent({
             )}
           </section>
 
-          {/* Lanes — Stage 5 placeholder */}
-          <section
-            aria-label="Lanes (Stage 5)"
-            className="border border-dashed border-stone-300 dark:border-stone-700 rounded p-6 text-center text-sm text-stone-400 dark:text-stone-500"
-          >
-            Lanes (gaze, pupil, AUs, emotion, click, scroll, …) arrive in Stage 5.
-          </section>
+          {/* Lanes (Stage 5) */}
+          <LaneContainer
+            payload={payload}
+            fromMs={ts.visibleRangeMs.from}
+            toMs={ts.visibleRangeMs.to}
+            currentMs={ts.currentMs}
+            episodeDurationMs={episodeDurationMs}
+            config={laneConfig}
+            onToggleVisible={(id) => setVisible(id, !laneConfig.settings[id].visible)}
+            onSetHeight={setHeight}
+            onMoveUp={(id) => moveLane(id, 'up')}
+            onMoveDown={(id) => moveLane(id, 'down')}
+            onSelectEvent={handleSelectEvent}
+            selectedEventId={selectedEventDomId}
+            gazeMode={gazeMode}
+            onGazeModeChange={setGazeMode}
+          />
         </div>
 
-        {/* Right: inspector placeholder (Stage 5) */}
-        <aside className="hidden xl:block">
-          <div className="sticky top-4 border border-stone-200 dark:border-stone-700 rounded p-4 bg-white dark:bg-stone-900 text-xs text-stone-500 space-y-2">
-            <div className="font-medium text-stone-700 dark:text-stone-200">Inspector</div>
-            <div>
-              <div className="text-stone-400 mb-0.5">Episode</div>
-              <code className="text-[10px]">{payload.episode.id}</code>
-            </div>
-            <div>
-              <div className="text-stone-400 mb-0.5">Sessions</div>
-              <ul className="space-y-1">
-                {payload.sessionBoundaries.map((b) => (
-                  <li
-                    key={b.sessionId}
-                    className="flex items-center justify-between text-[11px] hover:text-stone-700 dark:hover:text-stone-200 cursor-pointer"
-                    onClick={() => onSeek(b.sessionStartMs)}
-                  >
-                    <code className="font-mono">{b.sessionId.slice(0, 8)}</code>
-                    <span className="font-mono tabular-nums">
-                      +{formatDuration(b.sessionStartMs)}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            </div>
-            <div className="pt-2 border-t border-stone-200 dark:border-stone-700">
-              <div className="text-stone-400 mb-0.5">Video segments</div>
-              <div className="font-mono tabular-nums">
-                {payload.video.segments.length} · {formatDuration(payload.video.totalDurationMs)}{' '}
-                total
-              </div>
-            </div>
-            <div className="pt-2 border-t border-stone-200 dark:border-stone-700 italic text-stone-400">
-              Per-tick lane values appear here in Stage 5.
-            </div>
-          </div>
-
-          <div className="mt-3 text-[11px] text-stone-400">
-            <Link
-              to={`/teacher/research/courses/${payload.episode.courseId}/students/${payload.episode.userId}/episodes`}
-              className="hover:text-stone-700 dark:hover:text-stone-200"
-            >
-              ← Back to episodes for this student
-            </Link>
+        {/* Right: inspector (Stage 5) */}
+        <aside className={inspectorCollapsed ? 'hidden xl:block w-12' : 'hidden xl:block min-w-0'}>
+          <div className="sticky top-4">
+            <InspectorPanel
+              payload={payload}
+              currentMs={ts.currentMs}
+              selectedEvent={selectedEvent}
+              onJumpToSelected={(ms) => {
+                ts.setPlaying(false);
+                ts.setCurrentMs(ms);
+              }}
+              collapsed={inspectorCollapsed}
+              onToggleCollapsed={() => setInspectorCollapsed((c) => !c)}
+            />
           </div>
         </aside>
       </div>
