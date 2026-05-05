@@ -1,4 +1,6 @@
 import { useMemo, useState } from 'react';
+import { Link } from 'react-router-dom';
+import { Layers } from 'lucide-react';
 import { useSessionLogs } from './hooks/useSessionLogs';
 import { useSessionSummary } from './hooks/useSessionSummary';
 import { SummaryTab } from './tabs/SummaryTab';
@@ -73,12 +75,24 @@ export function SessionLogViewer({ sessionId, studentId, courseId }: Props) {
           <h2 className="text-sm font-medium text-gray-900 dark:text-gray-100">Session log</h2>
           <p className="text-xs text-gray-400 font-mono mt-0.5">{sessionId}</p>
         </div>
-        <button
-          onClick={handleExport}
-          className="text-xs px-3 py-1.5 rounded-md bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-300 transition-colors"
-        >
-          Export JSON
-        </button>
+        <div className="flex items-center gap-2">
+          {courseId && (
+            <Link
+              to={`/teacher/research/courses/${courseId}/students/${studentId}/episodes`}
+              className="flex items-center gap-1 text-xs px-3 py-1.5 rounded-md bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-950/30 dark:hover:bg-emerald-900/40 text-emerald-700 dark:text-emerald-400 transition-colors"
+              title="Open the retrospective tracing episode picker for this student in this course"
+            >
+              <Layers size={14} />
+              Episodes
+            </Link>
+          )}
+          <button
+            onClick={handleExport}
+            className="text-xs px-3 py-1.5 rounded-md bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-300 transition-colors"
+          >
+            Export JSON
+          </button>
+        </div>
       </div>
 
       {/* Tab bar */}

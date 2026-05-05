@@ -1,6 +1,6 @@
 import { format } from 'date-fns';
 import { Link } from 'react-router-dom';
-import { BarChart2 } from 'lucide-react';
+import { BarChart2, Layers } from 'lucide-react';
 
 interface Session {
   id: string;
@@ -8,6 +8,8 @@ interface Session {
   endedAt: string | null;
   durationSecs: number | null;
   liveEventCount?: number;
+  courseId?: string;
+  userId?: string;
   summary: {
     totalEvents: number;
     totalActiveTimeSecs: number;
@@ -20,9 +22,12 @@ interface Props {
   sessions: Session[];
   selectedId: string | null;
   onSelect: (id: string) => void;
+  /** When provided, renders an "Episodes" link per session for the
+   *  retrospective tracing teacher portal (prompt_retro Stage 4+). */
+  studentId?: string;
 }
 
-export function SessionList({ sessions, selectedId, onSelect }: Props) {
+export function SessionList({ sessions, selectedId, onSelect, studentId }: Props) {
   return (
     <ul className="divide-y divide-gray-100 dark:divide-gray-800">
       {sessions.map((s) => (
@@ -48,14 +53,27 @@ export function SessionList({ sessions, selectedId, onSelect }: Props) {
                 <Chip label={`${s.summary.interventionsTriggered} int.`} color="purple" />
               </div>
             )}
-            <Link
-              to={`/dashboard/sessions/${s.id}/timeline`}
-              className="flex items-center gap-1 text-sm text-blue-600 hover:text-blue-800 mt-1.5"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <BarChart2 size={14} />
-              Timeline
-            </Link>
+            <div className="flex items-center gap-3 mt-1.5">
+              <Link
+                to={`/dashboard/sessions/${s.id}/timeline`}
+                className="flex items-center gap-1 text-sm text-blue-600 hover:text-blue-800"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <BarChart2 size={14} />
+                Timeline
+              </Link>
+              {s.courseId && studentId && (
+                <Link
+                  to={`/teacher/research/courses/${s.courseId}/students/${studentId}/episodes`}
+                  className="flex items-center gap-1 text-sm text-emerald-700 dark:text-emerald-400 hover:text-emerald-900 dark:hover:text-emerald-300"
+                  onClick={(e) => e.stopPropagation()}
+                  title="Open the retrospective tracing episode picker for this student in this course"
+                >
+                  <Layers size={14} />
+                  Episodes
+                </Link>
+              )}
+            </div>
           </button>
         </li>
       ))}
