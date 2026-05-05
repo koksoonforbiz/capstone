@@ -41,7 +41,10 @@ const DEFAULT_SETTINGS: DialogueSettings = {
   enabledStudioTools: ['BRIEFING_DOC', 'FLASHCARD_SET', 'TABLE_COMPARISON', 'FAQ'],
 };
 
-const MODEL_OPTIONS: Record<string, { label: string; value: string }[]> = {
+// Static fallback used only if the dynamic /llm-settings/available-models
+// fetch fails. The list is fetched live so Google's preview-model retirements
+// (which silently 404 hardcoded IDs) don't break the dropdown.
+const FALLBACK_MODEL_OPTIONS: Record<string, { label: string; value: string }[]> = {
   openai: [
     { label: 'GPT-4o Mini', value: 'gpt-4o-mini' },
     { label: 'GPT-4o', value: 'gpt-4o' },
@@ -50,12 +53,17 @@ const MODEL_OPTIONS: Record<string, { label: string; value: string }[]> = {
   ],
   gemini: [
     { label: 'Gemini 2.0 Flash', value: 'gemini-2.0-flash' },
-    { label: 'Gemini 2.0 Flash Lite', value: 'gemini-2.0-flash-lite' },
-    { label: 'Gemini 2.5 Flash Preview', value: 'gemini-2.5-flash-preview' },
-    { label: 'Gemini 2.5 Pro Preview', value: 'gemini-2.5-pro-preview' },
+    { label: 'Gemini 2.5 Flash Lite', value: 'gemini-2.5-flash-lite' },
+    { label: 'Gemini 2.5 Flash', value: 'gemini-2.5-flash' },
+    { label: 'Gemini 2.5 Pro', value: 'gemini-2.5-pro' },
   ],
   fallback: [{ label: 'Fallback (no API key)', value: 'fallback' }],
 };
+
+interface AvailableModelsResponse {
+  models: Array<{ value: string; label: string }>;
+  source: 'live' | 'fallback';
+}
 
 const ALL_FILE_TYPES = [
   { key: 'PDF', label: 'PDF' },
@@ -111,6 +119,39 @@ export function DialogueCourseSettingsForm({ courseId, hasApiKey }: Props) {
   const [saving, setSaving] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
 
+  // Live model list fetched from /llm-settings/available-models so the
+  // dropdown stays in sync with whichever IDs the provider currently accepts.
+  const [availableModels, setAvailableModels] = useState<Array<{ value: string; label: string }>>(
+    [],
+  );
+  const [modelsSource, setModelsSource] = useState<'live' | 'fallback' | null>(null);
+
+  useEffect(() => {
+    if (settings.llmProvider === 'fallback') {
+      setAvailableModels(FALLBACK_MODEL_OPTIONS.fallback ?? []);
+      setModelsSource(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const data = await apiFetch<AvailableModelsResponse>(
+          `/llm-settings/available-models?provider=${encodeURIComponent(settings.llmProvider)}`,
+        );
+        if (cancelled) return;
+        setAvailableModels(data.models);
+        setModelsSource(data.source);
+      } catch {
+        if (cancelled) return;
+        setAvailableModels(FALLBACK_MODEL_OPTIONS[settings.llmProvider] ?? []);
+        setModelsSource('fallback');
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [settings.llmProvider]);
+
   useEffect(() => {
     const load = async () => {
       try {
@@ -133,7 +174,7 @@ export function DialogueCourseSettingsForm({ courseId, hasApiKey }: Props) {
         const next = { ...prev, [key]: value };
         // Auto-switch model when provider changes
         if (key === 'llmProvider') {
-          const models = MODEL_OPTIONS[value as string];
+          const models = FALLBACK_MODEL_OPTIONS[value as string];
           if (models && models[0]) {
             next.llmModel = models[0].value;
           }
@@ -220,13 +261,31 @@ export function DialogueCourseSettingsForm({ courseId, hasApiKey }: Props) {
 
           {settings.llmProvider !== 'fallback' && (
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Model</label>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Model
+                {modelsSource === 'live' && (
+                  <span className="ml-2 text-[10px] uppercase tracking-wide text-green-700 bg-green-100 px-1.5 py-0.5 rounded">
+                    live
+                  </span>
+                )}
+                {modelsSource === 'fallback' && (
+                  <span
+                    className="ml-2 text-[10px] uppercase tracking-wide text-amber-700 bg-amber-100 px-1.5 py-0.5 rounded"
+                    title="Couldn't fetch live model list (no key, network, or provider error). Showing the verified-good static list instead."
+                  >
+                    fallback
+                  </span>
+                )}
+              </label>
               <select
                 value={settings.llmModel}
                 onChange={(e) => updateField('llmModel', e.target.value)}
                 className="w-full max-w-xs px-3 py-2 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
               >
-                {(MODEL_OPTIONS[settings.llmProvider] || []).map((m) => (
+                {(availableModels.length > 0
+                  ? availableModels
+                  : FALLBACK_MODEL_OPTIONS[settings.llmProvider] || []
+                ).map((m) => (
                   <option key={m.value} value={m.value}>
                     {m.label}
                   </option>

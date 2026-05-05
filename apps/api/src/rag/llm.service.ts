@@ -426,6 +426,150 @@ export class LlmService {
     return credentials !== null;
   }
 
+  // ─── Available-models discovery ────────────────────────
+  //
+  // Hardcoded model lists in the UI go stale fast — Google retires preview
+  // model IDs every few months and dated suffixes like
+  // `gemini-2.5-pro-preview-05-06` start returning 404 without warning.
+  // listAvailableModels() asks the provider what's actually live (filtered
+  // to chat-capable models) and falls back to a verified static list if the
+  // user has no key, the provider call fails, or the response is empty.
+
+  private static readonly STATIC_GEMINI_FALLBACK: Array<{ value: string; label: string }> = [
+    { value: 'gemini-2.0-flash', label: 'Gemini 2.0 Flash (fast, GA)' },
+    { value: 'gemini-2.5-flash-lite', label: 'Gemini 2.5 Flash Lite (cheapest, GA)' },
+    { value: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash (best price/quality, GA)' },
+    { value: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro (most capable, GA)' },
+    { value: 'gemini-flash-latest', label: 'Gemini Flash Latest (auto-updates)' },
+    { value: 'gemini-pro-latest', label: 'Gemini Pro Latest (auto-updates)' },
+  ];
+
+  private static readonly STATIC_OPENAI_FALLBACK: Array<{ value: string; label: string }> = [
+    { value: 'gpt-4o-mini', label: 'GPT-4o Mini (fast, recommended)' },
+    { value: 'gpt-4o', label: 'GPT-4o (most capable)' },
+    { value: 'gpt-4-turbo', label: 'GPT-4 Turbo' },
+    { value: 'gpt-3.5-turbo', label: 'GPT-3.5 Turbo (cheapest)' },
+  ];
+
+  async listAvailableModels(
+    userId: string,
+    provider: 'openai' | 'gemini',
+  ): Promise<{ models: Array<{ value: string; label: string }>; source: 'live' | 'fallback' }> {
+    const credentials = await this.getUserApiKey(userId);
+    const apiKey = credentials?.provider === provider ? credentials.apiKey : null;
+
+    if (!apiKey) {
+      return {
+        models:
+          provider === 'gemini'
+            ? LlmService.STATIC_GEMINI_FALLBACK
+            : LlmService.STATIC_OPENAI_FALLBACK,
+        source: 'fallback',
+      };
+    }
+
+    try {
+      const live =
+        provider === 'gemini'
+          ? await this.fetchGeminiModels(apiKey)
+          : await this.fetchOpenAiModels(apiKey);
+      if (live.length === 0) {
+        // Empty after filtering means the key has restricted access; surface
+        // the fallback so the dropdown isn't empty.
+        throw new Error('provider returned no chat-capable models');
+      }
+      return { models: live, source: 'live' };
+    } catch (err) {
+      this.logger.warn(
+        `listAvailableModels(${provider}) live fetch failed for user ${userId}: ${
+          err instanceof Error ? err.message : err
+        } — returning static fallback`,
+      );
+      return {
+        models:
+          provider === 'gemini'
+            ? LlmService.STATIC_GEMINI_FALLBACK
+            : LlmService.STATIC_OPENAI_FALLBACK,
+        source: 'fallback',
+      };
+    }
+  }
+
+  private async fetchGeminiModels(
+    apiKey: string,
+  ): Promise<Array<{ value: string; label: string }>> {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}&pageSize=200`,
+    );
+    if (!res.ok) {
+      throw new Error(`gemini models.list HTTP ${res.status}`);
+    }
+    const data = (await res.json()) as {
+      models?: Array<{ name?: string; supportedGenerationMethods?: string[] }>;
+    };
+    const all = data.models ?? [];
+
+    // Filter: must support generateContent, must be a Gemini chat model (skip
+    // gemma-*, lyria-*, deep-research-*, robotics, tts, image-only, etc.) so
+    // teachers don't see hundreds of irrelevant entries.
+    const chat = all
+      .filter((m) => (m.supportedGenerationMethods ?? []).includes('generateContent'))
+      .map((m) => (m.name ?? '').replace(/^models\//, ''))
+      .filter(
+        (name) =>
+          /^gemini-/.test(name) &&
+          !/-tts$/.test(name) &&
+          !/-image(-preview)?$/.test(name) &&
+          !/-customtools$/.test(name) &&
+          !/computer-use/.test(name) &&
+          !/robotics/.test(name) &&
+          !/deep-research/.test(name),
+      );
+
+    // Sort: GA stable first, then "latest" aliases, then previews.
+    const score = (name: string) => {
+      if (/preview/.test(name)) return 3;
+      if (/latest/.test(name)) return 2;
+      return 1;
+    };
+    chat.sort((a, b) => {
+      const sa = score(a);
+      const sb = score(b);
+      if (sa !== sb) return sa - sb;
+      return a.localeCompare(b);
+    });
+
+    return chat.map((name) => ({ value: name, label: prettifyGeminiLabel(name) }));
+  }
+
+  private async fetchOpenAiModels(
+    apiKey: string,
+  ): Promise<Array<{ value: string; label: string }>> {
+    const res = await fetch('https://api.openai.com/v1/models', {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+    if (!res.ok) {
+      throw new Error(`openai /v1/models HTTP ${res.status}`);
+    }
+    const data = (await res.json()) as { data?: Array<{ id?: string }> };
+    const all = (data.data ?? []).map((m) => m.id ?? '').filter(Boolean);
+
+    // OpenAI's /v1/models lists *every* model the key has access to including
+    // embeddings, whisper, dall-e, tts, fine-tuned variants, realtime, etc.
+    // Most aren't usable as chat-completions targets — keep only the gpt/o*
+    // chat families.
+    const chatPrefixes = ['gpt-4', 'gpt-3.5', 'gpt-5', 'o1', 'o3', 'o4'];
+    const exclude = [/embedding/, /whisper/, /tts/, /dall-e/, /audio/, /realtime/, /:/];
+    const chat = all.filter(
+      (id) => chatPrefixes.some((p) => id.startsWith(p)) && !exclude.some((rx) => rx.test(id)),
+    );
+    chat.sort((a, b) => a.localeCompare(b));
+
+    return chat.map((id) => ({ value: id, label: id }));
+  }
+
+  // ─── End available-models ──────────────────────────────
+
   async callLlmForUser(
     userId: string,
     systemPrompt: string,
@@ -823,4 +967,31 @@ Rules:
       this.logger.error('Failed to create audit log', err);
     }
   }
+}
+
+// ─── Top-level helper used by LlmService.fetchGeminiModels ────────────────────
+
+function prettifyGeminiLabel(name: string): string {
+  // Build a friendly label from the raw model id. Keeps the id visible as a
+  // suffix so teachers can map back to docs.
+  const isPreview = /preview/.test(name);
+  const isLatest = /latest/.test(name);
+
+  // e.g. gemini-2.5-pro-preview-tts → "Gemini 2.5 Pro (preview)"
+  let pretty = name
+    .replace(/^gemini-/, 'Gemini ')
+    .replace(/-/g, ' ')
+    .replace(/\bpro\b/i, 'Pro')
+    .replace(/\bflash\b/i, 'Flash')
+    .replace(/\blite\b/i, 'Lite')
+    .replace(/\blatest\b/i, 'Latest')
+    .replace(/\bpreview\b/i, '')
+    .trim()
+    .replace(/\s+/g, ' ');
+
+  const tags: string[] = [];
+  if (isPreview) tags.push('preview');
+  if (isLatest) tags.push('auto-updates');
+  if (tags.length) pretty += ` (${tags.join(', ')})`;
+  return pretty;
 }
