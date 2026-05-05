@@ -40,6 +40,7 @@ import { JobsModule } from './jobs';
 import { TextMiningModule } from './text-mining';
 import { Openface3Module } from './openface3';
 import { AffectiveMappingModule } from './affective-mapping';
+import { EpisodeTimelineModule } from './research/episode-timeline';
 import { HealthController } from './health.controller';
 import { ThrottlerRedisStorage } from './common/throttle-redis.storage';
 
@@ -91,6 +92,7 @@ import { ThrottlerRedisStorage } from './common/throttle-redis.storage';
     TextMiningModule,
     Openface3Module,
     AffectiveMappingModule,
+    EpisodeTimelineModule,
   ],
   controllers: [HealthController],
 })
