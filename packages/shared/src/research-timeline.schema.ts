@@ -23,6 +23,8 @@ export const EpisodeListItemSchema = z.object({
   groupingMethod: z.string(),
   groupingConfidence: z.number().nullable(),
   hasVideo: z.boolean(),
+  /** Researcher-supplied notes (Stage 6) — surfaced in the picker as a tooltip. */
+  notes: z.string().nullable(),
   flags: z.object({
     atRiskCount: z.number(),
     refreshGapCount: z.number(),
@@ -217,6 +219,8 @@ export const TimelinePayloadSchema = z.object({
     sessionCount: z.number(),
     groupingMethod: z.string(),
     groupingConfidence: z.number().nullable(),
+    /** Researcher-supplied notes (Stage 6). */
+    notes: z.string().nullable(),
   }),
   sessionBoundaries: z.array(SessionBoundarySchema),
   video: z.object({

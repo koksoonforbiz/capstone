@@ -75,6 +75,10 @@ export class EpisodeTimelineService {
     const where: Prisma.LearningEpisodeWhereInput = {
       userId: studentId,
       courseId,
+      // Stage 6 soft-delete: hide merged-away episodes from the picker.
+      // The IDs remain resolvable on direct GET so researcher citations
+      // continue to work.
+      deletedAt: null,
       ...(opts.from || opts.to
         ? {
             startedAt: {
@@ -141,6 +145,7 @@ export class EpisodeTimelineService {
         groupingMethod: e.groupingMethod,
         groupingConfidence: e.groupingConfidence,
         hasVideo,
+        notes: e.notes,
         flags: {
           atRiskCount: atRiskPerEpisode.get(e.id) ?? 0,
           refreshGapCount: Math.max(0, e.sessionCount - 1),
@@ -367,6 +372,7 @@ export class EpisodeTimelineService {
         sessionCount: episode.sessionCount,
         groupingMethod: episode.groupingMethod,
         groupingConfidence: episode.groupingConfidence,
+        notes: episode.notes,
       },
       sessionBoundaries,
       video: { segments: videoSegments, totalDurationMs: totalVideoMs },

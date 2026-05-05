@@ -1416,6 +1416,10 @@ model LearningEpisode {
   groupingMethod     String    @map("grouping_method") // "client_episode_id" | "auto_heuristic" | "auto_heuristic_backfill" | "manual"
   groupingConfidence Float?    @map("grouping_confidence") // 0..1, null for client-provided or manual
   notes              String?
+  /// Soft-delete marker for merged-away episodes (Stage 6). A researcher's
+  /// paper might reference an episode ID that later got merged into another;
+  /// keep the row resolvable rather than hard-deleting.
+  deletedAt          DateTime? @map("deleted_at") @db.Timestamptz
 
   user     User             @relation(fields: [userId], references: [id], onDelete: Cascade)
   course   Course           @relation(fields: [courseId], references: [id], onDelete: Cascade)
@@ -1427,6 +1431,7 @@ model LearningEpisode {
 
   @@index([userId, courseId, startedAt])
   @@index([courseId, startedAt])
+  @@index([deletedAt])
   @@map("learning_episodes")
 }
 

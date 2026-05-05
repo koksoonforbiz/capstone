@@ -8,6 +8,10 @@ import { StitchedVideoPlayer } from '../../../components/research/StitchedVideoP
 import { TimelineRuler } from '../../../components/research/TimelineRuler';
 import { LaneContainer, type SelectedEventKind } from '../../../components/research/LaneContainer';
 import { InspectorPanel, type SelectedEvent } from '../../../components/research/InspectorPanel';
+import { MergeModal } from '../../../components/research/modals/MergeModal';
+import { SplitModal } from '../../../components/research/modals/SplitModal';
+import { DetachModal } from '../../../components/research/modals/DetachModal';
+import { ExportModal } from '../../../components/research/modals/ExportModal';
 
 /**
  * Retrospective tracing — the page where a researcher actually inspects an
@@ -176,6 +180,30 @@ function EpisodeTraceContent({
   const [gazeMode, setGazeMode] = useState<'trace' | 'density'>('trace');
   const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
 
+  // ─── Stage 6: mutation modals + audit refresh + toast ───────────────────
+  const [mergeOpen, setMergeOpen] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [splitTarget, setSplitTarget] = useState<{
+    sessionId: string;
+    index: number;
+  } | null>(null);
+  const [detachTarget, setDetachTarget] = useState<{ sessionId: string } | null>(null);
+  const [auditRefreshTick, setAuditRefreshTick] = useState(0);
+  const [toast, setToast] = useState<{
+    msg: string;
+    href?: string;
+    hrefLabel?: string;
+  } | null>(null);
+
+  // Auto-dismiss the toast after 8s.
+  useEffect(() => {
+    if (!toast) return;
+    const h = window.setTimeout(() => setToast(null), 8000);
+    return () => window.clearTimeout(h);
+  }, [toast]);
+
+  const isManual = payload.episode.groupingMethod === 'manual';
+
   // Click-to-jump on any lane marker: pause + seek + ensure visible window.
   const handleSelectEvent = useCallback(
     (kind: SelectedEventKind, eventPayload: unknown, tMs: number) => {
@@ -230,15 +258,25 @@ function EpisodeTraceContent({
           <h1 className="text-sm font-semibold text-stone-900 dark:text-stone-100 truncate">
             Episode <span className="font-mono">{payload.episode.id.slice(0, 8)}</span>
           </h1>
-          <div className="text-xs text-stone-500 truncate">
-            {episodeStartedAt.toLocaleString()}
-            <span className="mx-1.5">·</span>
-            {formatDuration(episodeDurationMs)}
-            <span className="mx-1.5">·</span>
-            {payload.episode.sessionCount}{' '}
-            {payload.episode.sessionCount === 1 ? 'session' : 'sessions'}
-            <span className="mx-1.5">·</span>
+          <div className="text-xs text-stone-500 truncate flex items-center gap-1.5 flex-wrap">
+            <span>{episodeStartedAt.toLocaleString()}</span>
+            <span>·</span>
+            <span>{formatDuration(episodeDurationMs)}</span>
+            <span>·</span>
+            <span>
+              {payload.episode.sessionCount}{' '}
+              {payload.episode.sessionCount === 1 ? 'session' : 'sessions'}
+            </span>
+            <span>·</span>
             <span className="capitalize">{groupingLabel}</span>
+            {isManual && (
+              <span
+                className="ml-1 px-1.5 py-0.5 rounded bg-stone-200 dark:bg-stone-700 text-stone-700 dark:text-stone-200 text-[10px] font-medium"
+                title="This episode was manually grouped by a researcher"
+              >
+                Manually grouped
+              </span>
+            )}
           </div>
         </div>
 
@@ -258,12 +296,17 @@ function EpisodeTraceContent({
             </select>
           </label>
 
-          {/* Stage-6 stub */}
           <button
             type="button"
-            disabled
-            title="Export — coming in Stage 6"
-            className="px-2 py-1 border border-stone-300 dark:border-stone-700 rounded opacity-50 cursor-not-allowed bg-white dark:bg-stone-900"
+            onClick={() => setMergeOpen(true)}
+            className="px-2 py-1 border border-stone-300 dark:border-stone-700 rounded hover:bg-stone-50 dark:hover:bg-stone-800 bg-white dark:bg-stone-900"
+          >
+            Merge with…
+          </button>
+          <button
+            type="button"
+            onClick={() => setExportOpen(true)}
+            className="px-2 py-1 border border-stone-300 dark:border-stone-700 rounded hover:bg-stone-50 dark:hover:bg-stone-800 bg-white dark:bg-stone-900"
           >
             Export ▾
           </button>
@@ -388,11 +431,182 @@ function EpisodeTraceContent({
               }}
               collapsed={inspectorCollapsed}
               onToggleCollapsed={() => setInspectorCollapsed((c) => !c)}
+              refreshTick={auditRefreshTick}
+              initialNotes={payload.episode.notes ?? null}
             />
           </div>
         </aside>
       </div>
+
+      {/* Mutation modals (Stage 6) */}
+      <MergeModal
+        open={mergeOpen}
+        onClose={() => setMergeOpen(false)}
+        episodeId={payload.episode.id}
+        courseId={payload.episode.courseId}
+        studentId={payload.episode.userId}
+        onMerged={(newPrimaryId) => {
+          setToast({
+            msg: `Episode merged → ${newPrimaryId.slice(0, 8)}.`,
+            href: `/teacher/research/episodes/${newPrimaryId}`,
+            hrefLabel: 'Open',
+          });
+          setAuditRefreshTick((t) => t + 1);
+          // If the user merged INTO this episode, just refresh; if INTO a
+          // different one, navigate to it.
+          if (newPrimaryId !== payload.episode.id) {
+            navigate(`/teacher/research/episodes/${newPrimaryId}`);
+          } else {
+            // Reload the timeline so aggregates are fresh.
+            window.location.reload();
+          }
+        }}
+      />
+      {splitTarget && (
+        <SplitModal
+          open
+          onClose={() => setSplitTarget(null)}
+          episodeId={payload.episode.id}
+          splitAtSessionId={splitTarget.sessionId}
+          splitAtIndex={splitTarget.index}
+          totalSessions={payload.episode.sessionCount}
+          onSplit={(newId) => {
+            setToast({
+              msg: `Episode split — new episode ${newId.slice(0, 8)} created.`,
+              href: `/teacher/research/episodes/${newId}`,
+              hrefLabel: 'Open new',
+            });
+            setAuditRefreshTick((t) => t + 1);
+            window.location.reload();
+          }}
+        />
+      )}
+      {detachTarget && (
+        <DetachModal
+          open
+          onClose={() => setDetachTarget(null)}
+          episodeId={payload.episode.id}
+          sessionId={detachTarget.sessionId}
+          courseId={payload.episode.courseId}
+          studentId={payload.episode.userId}
+          onDetached={(targetId) => {
+            setToast({
+              msg: `Session detached → episode ${targetId.slice(0, 8)}.`,
+              href: `/teacher/research/episodes/${targetId}`,
+              hrefLabel: 'Open target',
+            });
+            setAuditRefreshTick((t) => t + 1);
+            window.location.reload();
+          }}
+        />
+      )}
+      <ExportModal
+        open={exportOpen}
+        onClose={() => setExportOpen(false)}
+        episodeId={payload.episode.id}
+      />
+
+      {/* Toast */}
+      {toast && (
+        <div
+          role="status"
+          className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 bg-stone-900 text-stone-50 text-xs rounded shadow-lg px-3 py-2 flex items-center gap-2"
+        >
+          <span>{toast.msg}</span>
+          {toast.href && (
+            <a href={toast.href} className="underline text-emerald-300 hover:text-emerald-200">
+              {toast.hrefLabel ?? 'Open'}
+            </a>
+          )}
+          <button
+            type="button"
+            onClick={() => setToast(null)}
+            aria-label="Dismiss"
+            className="text-stone-400 hover:text-stone-100 ml-1"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
+      {/* Session-boundary action toolbar — discoverable handles for Split /
+          Detach (Stage 6). The spec asks for a hover ⋯ menu on refresh-gap
+          markers in the SVG ruler; an inline session list under the ruler
+          gives equivalent discoverability without bloating the ruler with
+          interactive DOM. */}
+      {payload.sessionBoundaries.length > 1 && (
+        <SessionsActionStrip
+          payload={payload}
+          onSplit={(sessionId, index) => setSplitTarget({ sessionId, index })}
+          onDetach={(sessionId) => setDetachTarget({ sessionId })}
+          onSeek={(ms) => {
+            ts.setPlaying(false);
+            ts.setCurrentMs(ms);
+          }}
+        />
+      )}
     </div>
+  );
+}
+
+function SessionsActionStrip({
+  payload,
+  onSplit,
+  onDetach,
+  onSeek,
+}: {
+  payload: TimelinePayload;
+  onSplit: (sessionId: string, index: number) => void;
+  onDetach: (sessionId: string) => void;
+  onSeek: (ms: number) => void;
+}) {
+  return (
+    <details className="fixed left-6 bottom-6 max-w-md bg-white dark:bg-stone-900 border border-stone-200 dark:border-stone-700 rounded shadow text-xs">
+      <summary className="px-3 py-1.5 cursor-pointer select-none text-stone-600 dark:text-stone-300 hover:text-stone-900 dark:hover:text-stone-100">
+        Sessions ({payload.sessionBoundaries.length}) · Split / Detach
+      </summary>
+      <ul className="max-h-72 overflow-y-auto divide-y divide-stone-200 dark:divide-stone-700">
+        {payload.sessionBoundaries.map((b, i) => (
+          <li
+            key={b.sessionId}
+            className="flex items-center gap-2 px-3 py-1.5 hover:bg-stone-50 dark:hover:bg-stone-800/40"
+          >
+            <button
+              type="button"
+              onClick={() => onSeek(b.sessionStartMs)}
+              className="font-mono text-[11px] text-left"
+              title={`Jump to +${formatDuration(b.sessionStartMs)}`}
+            >
+              {b.sessionId.slice(0, 8)}
+            </button>
+            {b.refreshGapMsBefore !== null && b.refreshGapMsBefore > 0 && (
+              <span className="text-[10px] text-amber-600 dark:text-amber-400">
+                refresh +{formatDuration(b.refreshGapMsBefore)}
+              </span>
+            )}
+            <span className="ml-auto flex gap-1">
+              <button
+                type="button"
+                onClick={() => onSplit(b.sessionId, i)}
+                disabled={i === 0}
+                className="text-[10px] px-1.5 py-0.5 border border-stone-300 dark:border-stone-700 rounded hover:bg-stone-50 dark:hover:bg-stone-800 disabled:opacity-30 disabled:cursor-not-allowed"
+                title={i === 0 ? 'Cannot split before the first session' : 'Split episode here'}
+              >
+                Split
+              </button>
+              <button
+                type="button"
+                onClick={() => onDetach(b.sessionId)}
+                disabled={payload.sessionBoundaries.length === 1}
+                className="text-[10px] px-1.5 py-0.5 border border-stone-300 dark:border-stone-700 rounded hover:bg-stone-50 dark:hover:bg-stone-800 disabled:opacity-30"
+              >
+                Detach
+              </button>
+            </span>
+          </li>
+        ))}
+      </ul>
+    </details>
   );
 }
 

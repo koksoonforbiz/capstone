@@ -1,7 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { TimelinePayload } from '@ats/shared';
 import { useThrottled } from '../../hooks/useThrottled';
 import { GazeMiniMap } from './GazeMiniMap';
+import { researchMgmt, summarizeAudit, type AuditEntry } from '../../lib/research-management';
+import { ApiError } from '../../lib/api';
 
 /**
  * Inspector panel (Stage 5).
@@ -30,6 +32,10 @@ type Props = {
   onClose?: () => void;
   collapsed?: boolean;
   onToggleCollapsed?: () => void;
+  /** Bumped externally after a mutation lands so audit + notes refresh. */
+  refreshTick?: number;
+  /** Initial notes from the timeline payload (pre-fetched). */
+  initialNotes?: string | null;
 };
 
 export function InspectorPanel({
@@ -40,6 +46,8 @@ export function InspectorPanel({
   onClose,
   collapsed,
   onToggleCollapsed,
+  refreshTick = 0,
+  initialNotes = null,
 }: Props) {
   const [tab, setTab] = useState<Tab>('now');
 
@@ -112,8 +120,16 @@ export function InspectorPanel({
       <div className="flex-1 overflow-y-auto p-3 text-xs text-stone-700 dark:text-stone-200 space-y-3">
         {tab === 'now' && <NowTab payload={payload} currentMs={currentMs} />}
         {tab === 'selected' && <SelectedTab event={selectedEvent} onJumpTo={onJumpToSelected} />}
-        {tab === 'session' && <SessionTab payload={payload} currentMs={currentMs} />}
-        {tab === 'notes' && <NotesTab />}
+        {tab === 'session' && (
+          <SessionTab payload={payload} currentMs={currentMs} refreshTick={refreshTick} />
+        )}
+        {tab === 'notes' && (
+          <NotesTab
+            episodeId={payload.episode.id}
+            initialNotes={initialNotes}
+            refreshTick={refreshTick}
+          />
+        )}
       </div>
     </div>
   );
@@ -369,7 +385,15 @@ function SelectedTab({
 
 // ─── Session ────────────────────────────────────────────────────────────
 
-function SessionTab({ payload, currentMs }: { payload: TimelinePayload; currentMs: number }) {
+function SessionTab({
+  payload,
+  currentMs,
+  refreshTick,
+}: {
+  payload: TimelinePayload;
+  currentMs: number;
+  refreshTick: number;
+}) {
   const session = useMemo(() => {
     const sorted = [...payload.sessionBoundaries].sort(
       (a, b) => a.sessionStartMs - b.sessionStartMs,
@@ -381,34 +405,88 @@ function SessionTab({ payload, currentMs }: { payload: TimelinePayload; currentM
     return active;
   }, [payload.sessionBoundaries, currentMs]);
 
-  if (!session) {
-    return <Empty>No session recorded at this point.</Empty>;
-  }
+  // Episode-level audit history (Stage 6).
+  const [audits, setAudits] = useState<AuditEntry[]>([]);
+  const [auditError, setAuditError] = useState<string | null>(null);
+  const [auditLoading, setAuditLoading] = useState(false);
 
-  const idx = payload.sessionBoundaries.findIndex((s) => s.sessionId === session.sessionId);
-  const next = payload.sessionBoundaries[idx + 1] ?? null;
-  const refreshGap = next?.refreshGapMsBefore ?? null;
+  useEffect(() => {
+    let cancelled = false;
+    setAuditLoading(true);
+    setAuditError(null);
+    researchMgmt
+      .getAudit(payload.episode.id)
+      .then((rows) => {
+        if (cancelled) return;
+        setAudits(rows);
+        setAuditLoading(false);
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        setAuditError(e instanceof ApiError ? e.message : (e as Error).message);
+        setAuditLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [payload.episode.id, refreshTick]);
 
   return (
     <>
-      <Section label="Session">
-        <Row label="ID" value={session.sessionId} mono />
-        <Row label="startedAt" value={`+${formatHMS(session.sessionStartMs)}`} mono />
-        <Row
-          label="endedAt"
-          value={
-            session.sessionEndMs !== null ? `+${formatHMS(session.sessionEndMs)}` : '— (still open)'
-          }
-          mono
-        />
-        {session.userAgent && <Row label="UA" value={session.userAgent} />}
-        {session.ipAddress && <Row label="IP" value={session.ipAddress} mono />}
-      </Section>
-      <Section label="Refresh gap">
-        {refreshGap !== null && refreshGap > 0 ? (
-          <Row label="to next session" value={formatGap(refreshGap)} />
-        ) : (
-          <Empty>no gap to next session</Empty>
+      {session ? (
+        <>
+          <Section label="Session">
+            <Row label="ID" value={session.sessionId} mono />
+            <Row label="startedAt" value={`+${formatHMS(session.sessionStartMs)}`} mono />
+            <Row
+              label="endedAt"
+              value={
+                session.sessionEndMs !== null
+                  ? `+${formatHMS(session.sessionEndMs)}`
+                  : '— (still open)'
+              }
+              mono
+            />
+            {session.userAgent && <Row label="UA" value={session.userAgent} />}
+            {session.ipAddress && <Row label="IP" value={session.ipAddress} mono />}
+          </Section>
+          <Section label="Refresh gap">
+            {(() => {
+              const idx = payload.sessionBoundaries.findIndex(
+                (s) => s.sessionId === session.sessionId,
+              );
+              const next = payload.sessionBoundaries[idx + 1] ?? null;
+              const refreshGap = next?.refreshGapMsBefore ?? null;
+              return refreshGap !== null && refreshGap > 0 ? (
+                <Row label="to next session" value={formatGap(refreshGap)} />
+              ) : (
+                <Empty>no gap to next session</Empty>
+              );
+            })()}
+          </Section>
+        </>
+      ) : (
+        <Empty>No session recorded at this point.</Empty>
+      )}
+
+      {/* Episode-level audit trail (Stage 6) */}
+      <Section label="Episode history">
+        {auditLoading && <Empty>loading…</Empty>}
+        {auditError && <div className="text-red-600 text-[11px]">{auditError}</div>}
+        {!auditLoading && !auditError && audits.length === 0 && <Empty>no audit entries yet</Empty>}
+        {!auditLoading && audits.length > 0 && (
+          <ul className="space-y-1.5 mt-1">
+            {audits.map((a) => (
+              <li key={a.id} className="border-l-2 border-stone-300 dark:border-stone-700 pl-2">
+                <div className="text-[10px] text-stone-400">
+                  {new Date(a.createdAt).toLocaleString()}
+                  <span className="mx-1">·</span>
+                  {a.actor?.name ?? 'system'}
+                </div>
+                <div className="text-[11px]">{summarizeAudit(a)}</div>
+              </li>
+            ))}
+          </ul>
         )}
       </Section>
     </>
@@ -417,31 +495,85 @@ function SessionTab({ payload, currentMs }: { payload: TimelinePayload; currentM
 
 // ─── Notes ──────────────────────────────────────────────────────────────
 
-function NotesTab() {
-  const [value, setValue] = useState('');
+function NotesTab({
+  episodeId,
+  initialNotes,
+  refreshTick,
+}: {
+  episodeId: string;
+  initialNotes: string | null;
+  refreshTick: number;
+}) {
+  const [value, setValue] = useState(initialNotes ?? '');
+  const [savedValue, setSavedValue] = useState(initialNotes ?? '');
+  const [savedAt, setSavedAt] = useState<Date | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Resync if the episode changes externally (refreshTick bump from a
+  // mutation).
+  useEffect(() => {
+    setValue(initialNotes ?? '');
+    setSavedValue(initialNotes ?? '');
+  }, [initialNotes, refreshTick]);
+
+  const dirty = value !== savedValue;
+
+  const save = useCallback(async () => {
+    if (!dirty) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const res = await researchMgmt.annotate(episodeId, value);
+      setSavedValue(res.notes);
+      setSavedAt(new Date());
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : (e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  }, [episodeId, value, dirty]);
+
   return (
     <>
       <textarea
         value={value}
         onChange={(e) => setValue(e.target.value)}
+        onBlur={save}
         rows={10}
         className="w-full text-xs border border-stone-300 dark:border-stone-700 rounded p-2 bg-stone-50 dark:bg-stone-950"
-        placeholder="Researcher notes for this episode…"
+        placeholder="Researcher notes for this episode (auto-saves on blur)…"
       />
-      <button
-        type="button"
-        disabled
-        title="Available in Stage 6 (annotations API)"
-        className="mt-2 text-[10px] px-2 py-1 border border-stone-300 dark:border-stone-700 rounded opacity-50 cursor-not-allowed"
-      >
-        Save
-      </button>
-      <div className="text-[10px] text-stone-400 italic">
-        Local-only for now. Persistence lands in Stage 6 along with the annotations / merge-split
-        API.
+      <div className="mt-2 flex items-center gap-2 text-[10px] text-stone-400">
+        {saving ? (
+          <span>Saving…</span>
+        ) : dirty ? (
+          <button
+            type="button"
+            onClick={save}
+            className="px-2 py-0.5 border border-stone-300 dark:border-stone-700 rounded hover:bg-stone-50 dark:hover:bg-stone-800 text-stone-700 dark:text-stone-200"
+          >
+            Save now
+          </button>
+        ) : savedAt ? (
+          <span>Saved {timeAgo(savedAt)}</span>
+        ) : (
+          <span className="italic">
+            Notes auto-save on blur and surface in the episode picker tooltip.
+          </span>
+        )}
+        {error && <span className="text-red-600">{error}</span>}
       </div>
     </>
   );
+}
+
+function timeAgo(d: Date): string {
+  const diff = Math.floor((Date.now() - d.getTime()) / 1000);
+  if (diff < 5) return 'just now';
+  if (diff < 60) return `${diff}s ago`;
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  return `${Math.floor(diff / 3600)}h ago`;
 }
 
 // ─── Atoms ──────────────────────────────────────────────────────────────
