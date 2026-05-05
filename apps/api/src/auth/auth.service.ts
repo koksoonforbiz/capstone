@@ -77,7 +77,7 @@ export class AuthService {
 
   async login(
     dto: Login,
-    requestMeta?: { ip?: string; userAgent?: string },
+    requestMeta?: { ip?: string; userAgent?: string; clientEpisodeId?: string },
   ): Promise<AuthResponse | PasswordChangeRequired> {
     const user = await this.prisma.user.findUnique({
       where: { email: dto.email },
@@ -115,6 +115,7 @@ export class AuthService {
       userId: user.id,
       ipAddress: requestMeta?.ip,
       userAgent: requestMeta?.userAgent,
+      clientEpisodeId: requestMeta?.clientEpisodeId,
     });
 
     return {

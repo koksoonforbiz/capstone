@@ -17,6 +17,7 @@ import { useAuth } from '../../contexts/AuthContext';
 import { useToast } from '../../components/Toast';
 import { useActivityLog } from '../../lib/activity-log';
 import { usePageContext } from '../../contexts/PageContext';
+import { useLearningEpisode } from '../../hooks/useLearningEpisode';
 import { SourcesPanel } from '../../components/dialogue/SourcesPanel';
 import { ChatPanel } from '../../components/dialogue/ChatPanel';
 import { StudioPanel } from '../../components/dialogue/StudioPanel';
@@ -53,6 +54,10 @@ export function DialogueLearning() {
   const { toast } = useToast();
   const { track } = useActivityLog();
   const { setPageContext } = usePageContext();
+
+  // Idempotent — covers direct deep-links into /dialogue that bypass
+  // StudentCourseViewPage. See prompt_retro Stage 2.
+  useLearningEpisode(courseId);
 
   // Set page context so the floating chatbot knows we're in a course
   useEffect(() => {

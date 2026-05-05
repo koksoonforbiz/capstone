@@ -34,6 +34,10 @@ export class AuthController {
     return this.authService.login(dto, {
       ip: req?.ip,
       userAgent: req?.headers?.['user-agent'],
+      // Express lowercases header names — read both forms defensively just
+      // in case the request came through a non-Express stack in tests.
+      clientEpisodeId:
+        req?.headers?.['x-learning-episode-id'] ?? req?.headers?.['X-Learning-Episode-Id'],
     });
   }
 

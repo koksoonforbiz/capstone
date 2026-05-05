@@ -1,3 +1,5 @@
+import { readEpisodeIdOrNull, touchEpisodeActivity } from './learning-episode';
+
 const API_BASE = '/api';
 
 /** Background biometric paths that should NOT trigger a login redirect on 401. */
@@ -27,11 +29,17 @@ export class ApiError extends Error {
 export async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
   const token = localStorage.getItem('token');
   const sessionId = sessionStorage.getItem('ats_session_id');
+  // The learning-episode ID, if we have one, lets the server group multiple
+  // StudentSession rows from the same study sitting into a single
+  // LearningEpisode (prompt_retro Stage 2). Read-only here — rotation is
+  // handled by useLearningEpisode/getOrCreateEpisodeId.
+  const learningEpisodeId = readEpisodeIdOrNull();
 
   const headers: HeadersInit = {
     'Content-Type': 'application/json',
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
     ...(sessionId ? { 'X-Session-Id': sessionId } : {}),
+    ...(learningEpisodeId ? { 'X-Learning-Episode-Id': learningEpisodeId } : {}),
     ...options?.headers,
   };
 
@@ -56,6 +64,10 @@ export async function apiFetch<T>(path: string, options?: RequestInit): Promise<
     const body = await res.json().catch(() => ({}));
     throw new ApiError(res.status, body.message || `API error: ${res.status}`, body.errors);
   }
+
+  // Cheap heartbeat — keeps the active episode from rotating mid-sitting
+  // even if the React tree isn't re-rendering.
+  touchEpisodeActivity();
 
   // Handle empty responses
   const text = await res.text();
