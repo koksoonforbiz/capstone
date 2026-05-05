@@ -1565,6 +1565,8 @@ model RecordingSegment {
 
   @@index([studentId, sessionId])
   @@index([courseId])
+  // Stage 3 timeline-API hot path: bound by sessionId then walltime range.
+  @@index([sessionId, startWallTime])
   @@map("recording_segments")
 }
 
@@ -1609,6 +1611,7 @@ model PupilSizeLog {
 
   @@index([studentId, sessionId])
   @@index([courseId])
+  @@index([sessionId, timestamp])
   @@map("pupil_size_logs")
 }
 
@@ -1645,6 +1648,7 @@ model WebgazerLog {
 
   @@index([studentId, sessionId])
   @@index([courseId])
+  @@index([sessionId, timestamp])
   @@map("webgazer_logs")
 }
 
