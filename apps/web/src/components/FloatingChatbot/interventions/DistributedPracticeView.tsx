@@ -56,6 +56,7 @@ export function DistributedPracticeView({
         courseId,
         contentId: contentId || undefined,
         pageType,
+        topic: contentTitle || undefined,
         cardCount: 5,
       });
       setInterventionId(result.interventionId);
@@ -135,7 +136,10 @@ export function DistributedPracticeView({
         <p className="text-sm text-gray-600">Creating flashcards...</p>
         <p className="text-xs text-gray-400 mt-2">This may take a few seconds</p>
         <div className="w-48 bg-gray-200 rounded-full h-1.5 mt-4 overflow-hidden">
-          <div className="bg-blue-500 h-1.5 rounded-full" style={{ width: '40%', animation: 'indeterminate 1.5s ease-in-out infinite' }} />
+          <div
+            className="bg-blue-500 h-1.5 rounded-full"
+            style={{ width: '40%', animation: 'indeterminate 1.5s ease-in-out infinite' }}
+          />
         </div>
         <style>{`@keyframes indeterminate { 0% { transform: translateX(-100%); } 100% { transform: translateX(350%); } }`}</style>
       </div>
