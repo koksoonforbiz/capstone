@@ -2028,7 +2028,18 @@ model aligned_frames {
 model EfDetection {
   id            String   @id @default(cuid())
   messageId     String
+  // The dialogue-session ID the message was sent in. Used by the
+  // teacher's text-mining dashboard / live feed to scope detections to
+  // a single chat thread.
   sessionId     String
+  // The activity / login-session ID (StudentSession.id) the student was
+  // in when they sent the message. Optional because pre-existing rows
+  // were inserted before this column existed, and because the dialogue
+  // can in principle be sent without an active /session/open. Used by
+  // the retro-tracing episode-timeline service to surface EF events on
+  // the same timeline as everything else (which is keyed by
+  // StudentSession.id).
+  studentSessionId String?
   studentId     String
   courseId      String?
   constructKey  String
@@ -2045,6 +2056,7 @@ model EfDetection {
   createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
 
   @@index([sessionId, constructKey, createdAt])
+  @@index([studentSessionId, constructKey, createdAt])
   @@index([studentId, constructKey, createdAt])
   @@index([messageId])
   @@map("ef_detections")

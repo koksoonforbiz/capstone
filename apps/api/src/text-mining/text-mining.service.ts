@@ -18,7 +18,16 @@ export class TextMiningService implements OnModuleInit {
 
   async ingest(args: {
     messageId: string;
+    /** DialogueSession.id — used by the live teacher dashboard / per-thread queries. */
     sessionId: string;
+    /**
+     * StudentSession.id (login / activity session). When present, this
+     * is what the retrospective tracing's episode-timeline aggregator
+     * uses to attach EF detections to the same timeline as activity
+     * logs, gaze, recordings, etc. Optional because dialogue can in
+     * principle run without a `/session/open` having succeeded.
+     */
+    studentSessionId?: string;
     studentId: string;
     courseId: string | null;
     teacherId: string;
@@ -40,6 +49,7 @@ export class TextMiningService implements OnModuleInit {
       data: enabledConstructs.map((c) => ({
         messageId: args.messageId,
         sessionId: args.sessionId,
+        studentSessionId: args.studentSessionId ?? null,
         studentId: args.studentId,
         courseId: args.courseId,
         constructKey: c.key,

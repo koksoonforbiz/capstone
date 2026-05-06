@@ -46,12 +46,36 @@ export class BlobService implements OnModuleInit {
       secretAccessKey: this.config.getOrThrow<string>('BLOB_STORAGE_SECRET_KEY'),
     };
 
+    // AWS SDK v3 (≥ 3.729) defaults `requestChecksumCalculation` to
+    // `WHEN_SUPPORTED`, which embeds an `x-amz-checksum-crc32` query
+    // param in presigned PUT/UploadPart URLs that captures the CRC32 of
+    // an EMPTY body (the body isn't known at presign time). When the
+    // browser later PUTs the actual webm blob, MinIO computes the body
+    // CRC, sees it disagree with the signed param, and rejects with
+    // BadDigest — which the Vite dev proxy surfaces as `ECONNRESET`.
+    //
+    // The recorder pre-PR-#22 used single-PUT uploads and worked under
+    // the older SDK default. Since the multipart streaming path landed,
+    // every UploadPart presign has carried this stale CRC param — no
+    // part has ever uploaded successfully on this version of the SDK.
+    //
+    // `WHEN_REQUIRED` skips checksum middleware unless the caller asks
+    // for it explicitly, restoring the older presign-friendly behavior.
+    // We apply it to both clients for symmetry; the internal client
+    // doesn't presign but does PUT directly, and the same bug bites
+    // there if MinIO ever tightens checksum strictness.
+    const checksumOverrides = {
+      requestChecksumCalculation: 'WHEN_REQUIRED' as const,
+      responseChecksumValidation: 'WHEN_REQUIRED' as const,
+    };
+
     // Internal client for direct S3 operations (put, get, delete)
     this.client = new S3Client({
       endpoint: this.internalEndpoint,
       region,
       credentials,
       forcePathStyle: true,
+      ...checksumOverrides,
     });
 
     // Presigning client uses the public endpoint so browser-signed URLs
@@ -61,6 +85,7 @@ export class BlobService implements OnModuleInit {
       region,
       credentials,
       forcePathStyle: true,
+      ...checksumOverrides,
     });
   }
 

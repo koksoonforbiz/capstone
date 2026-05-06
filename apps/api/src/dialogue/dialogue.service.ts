@@ -224,11 +224,17 @@ export class DialogueService {
       }),
     ]);
 
-    // Fire-and-forget EF text-mining detection on the user message
+    // Fire-and-forget EF text-mining detection on the user message.
+    // We thread `activitySessionId` (StudentSession.id) through so the
+    // resulting rows can be surfaced on the retro-tracing episode
+    // timeline, which keys every lane by StudentSession.id. The
+    // `sessionId` field continues to hold the DialogueSession.id so
+    // the live teacher dashboard / per-thread queries are unchanged.
     this.textMining
       .ingest({
         messageId: userMsg.id,
         sessionId,
+        studentSessionId: activitySessionId,
         studentId,
         courseId: session.courseId,
         teacherId,

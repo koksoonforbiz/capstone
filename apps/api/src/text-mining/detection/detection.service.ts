@@ -35,7 +35,10 @@ export class DetectionService {
 
   async detectAllForMessage(args: {
     messageId: string;
+    /** DialogueSession.id */
     sessionId: string;
+    /** StudentSession.id (login/activity session) — see EfDetection.studentSessionId */
+    studentSessionId?: string;
     studentId: string;
     courseId: string | null;
     teacherId: string;
@@ -220,6 +223,7 @@ export class DetectionService {
         data: results.map((r) => ({
           messageId: args.messageId,
           sessionId: args.sessionId,
+          studentSessionId: args.studentSessionId ?? null,
           studentId: args.studentId,
           courseId: args.courseId,
           constructKey: r.constructKey,
