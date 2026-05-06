@@ -575,6 +575,189 @@ function StudentDetailModal({
   );
 }
 
+// ─── Delete Student Modal ───────────────────────────────
+
+interface DeleteStudentResponse {
+  deleted: { id: string; email: string; name: string };
+  rowCounts: Record<string, number>;
+}
+
+/**
+ * Two-step confirmation for permanent student deletion. The teacher
+ * must type the student's email exactly to enable the destructive
+ * button — a standard "type-to-confirm" pattern for irreversible ops.
+ *
+ * After success the modal shows a row-count summary so the teacher
+ * can sanity-check what was actually removed before the toast clears.
+ */
+function DeleteStudentModal({
+  student,
+  onClose,
+  onDeleted,
+}: {
+  student: Student;
+  onClose: () => void;
+  onDeleted: () => void;
+}) {
+  const { toast } = useToast();
+  const [confirmation, setConfirmation] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<DeleteStudentResponse | null>(null);
+
+  const canDelete = confirmation.trim().toLowerCase() === student.email.toLowerCase();
+
+  const handleDelete = async () => {
+    setBusy(true);
+    try {
+      const res = await api.delete<DeleteStudentResponse>(
+        `/user-management/students/${student.id}`,
+      );
+      setResult(res);
+      toast('success', `Deleted ${res.deleted.name}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to delete student';
+      toast('error', msg);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // After a successful delete, the parent list needs to refetch.
+  // Defer notifying the parent until the teacher acknowledges the
+  // result so they get a chance to read the row-count summary.
+  const handleClose = () => {
+    if (result) onDeleted();
+    onClose();
+  };
+
+  // Only show non-zero row counts in the summary so the teacher's
+  // eyes don't have to wade through twenty zeroes.
+  const summaryRows = result
+    ? Object.entries(result.rowCounts).filter(([, count]) => count > 0)
+    : [];
+
+  return (
+    <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
+      <div className="bg-white rounded-lg shadow-xl w-full max-w-lg max-h-[90vh] overflow-y-auto">
+        <div className="p-5 border-b">
+          <h3 className="text-lg font-semibold text-red-700">
+            {result ? 'Student deleted' : 'Delete student account?'}
+          </h3>
+        </div>
+
+        <div className="p-5 space-y-4">
+          {!result && (
+            <>
+              <p className="text-sm text-gray-700">
+                This will <strong>permanently delete</strong> <strong>{student.name}</strong> (
+                {student.email}) and every record they generated, across every course they were
+                enrolled in.
+              </p>
+
+              <div className="bg-red-50 border border-red-200 rounded p-3 text-xs text-red-900 space-y-1">
+                <p className="font-medium">What gets removed:</p>
+                <ul className="list-disc list-inside space-y-0.5">
+                  <li>Login account &amp; all enrollments</li>
+                  <li>Quiz attempts, grading results, mastery, knowledge components</li>
+                  <li>Activity / cursor / click / scroll / keystroke / visibility logs</li>
+                  <li>Webcam recordings, gaze tracking, pupil-size data, py-feat jobs</li>
+                  <li>OpenFace 3 emotion frames &amp; affective-state windows</li>
+                  <li>EF text-mining detections</li>
+                  <li>Dialogue chat history, notes, RAG-uploaded materials</li>
+                  <li>Learning interventions, spaced-repetition cards, session summaries</li>
+                  <li>Retrospective-tracing episodes</li>
+                </ul>
+                <p className="pt-1">
+                  Storage note: webcam blobs in MinIO are not removed by this call — the database
+                  row is gone but the underlying object remains until an offline reaper sweep.
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-gray-700 mb-1">
+                  Type{' '}
+                  <code className="font-mono text-[11px] bg-gray-100 px-1 py-0.5 rounded">
+                    {student.email}
+                  </code>{' '}
+                  to confirm:
+                </label>
+                <input
+                  type="text"
+                  value={confirmation}
+                  onChange={(e) => setConfirmation(e.target.value)}
+                  placeholder={student.email}
+                  disabled={busy}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm font-mono"
+                />
+              </div>
+            </>
+          )}
+
+          {result && (
+            <>
+              <p className="text-sm text-gray-700">
+                <strong>{result.deleted.name}</strong> ({result.deleted.email}) and their data have
+                been removed.
+              </p>
+              {summaryRows.length > 0 ? (
+                <div className="bg-gray-50 border border-gray-200 rounded p-3">
+                  <p className="text-xs font-medium text-gray-700 mb-2">
+                    Rows removed (manual cleanup; cascaded rows not counted):
+                  </p>
+                  <table className="w-full text-xs">
+                    <tbody>
+                      {summaryRows.map(([table, count]) => (
+                        <tr key={table}>
+                          <td className="py-0.5 text-gray-600 font-mono">{table}</td>
+                          <td className="py-0.5 text-right text-gray-900">{count}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <p className="text-xs text-gray-500 italic">
+                  No manual-cleanup rows — the student had no biometric or dialogue history yet.
+                  Cascade-deleted rows (enrollments, sessions, etc) are not individually counted.
+                </p>
+              )}
+            </>
+          )}
+        </div>
+
+        <div className="px-5 py-3 border-t bg-gray-50 flex justify-end gap-2">
+          {!result && (
+            <>
+              <button
+                onClick={onClose}
+                disabled={busy}
+                className="px-3 py-1.5 text-sm border rounded-lg hover:bg-white disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleDelete}
+                disabled={!canDelete || busy}
+                className="px-3 py-1.5 text-sm bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {busy ? 'Deleting…' : 'Delete permanently'}
+              </button>
+            </>
+          )}
+          {result && (
+            <button
+              onClick={handleClose}
+              className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+            >
+              Done
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Main Page ──────────────────────────────────────────
 
 export function UserManagementPage() {
@@ -590,6 +773,7 @@ export function UserManagementPage() {
   const [loading, setLoading] = useState(true);
   const [selectedStudent, setSelectedStudent] = useState<Student | null>(null);
   const [showAddModal, setShowAddModal] = useState(false);
+  const [studentToDelete, setStudentToDelete] = useState<Student | null>(null);
 
   // Teacher usage tab state
   const [teacherUsage, setTeacherUsage] = useState<TokenUsage | null>(null);
@@ -830,6 +1014,13 @@ export function UserManagementPage() {
                           >
                             Logs
                           </Link>
+                          <button
+                            onClick={() => setStudentToDelete(student)}
+                            className="text-sm text-red-600 hover:underline"
+                            title="Delete student account and all their data"
+                          >
+                            Delete
+                          </button>
                         </td>
                       </tr>
                     ))}
@@ -1005,6 +1196,23 @@ export function UserManagementPage() {
           student={selectedStudent}
           onClose={() => setSelectedStudent(null)}
           onResendInvitation={handleResendInvitation}
+        />
+      )}
+
+      {studentToDelete && (
+        <DeleteStudentModal
+          student={studentToDelete}
+          onClose={() => setStudentToDelete(null)}
+          onDeleted={() => {
+            // After acknowledged success, re-load the list and bounce
+            // back to page 1 if the current page is now empty.
+            setStudentToDelete(null);
+            if (students.length === 1 && page > 1) {
+              setPage(page - 1);
+            } else {
+              loadStudents();
+            }
+          }}
         />
       )}
     </div>

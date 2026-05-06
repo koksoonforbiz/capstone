@@ -3,6 +3,7 @@ import {
   NotFoundException,
   ForbiddenException,
   ConflictException,
+  BadRequestException,
   Logger,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
@@ -671,6 +672,193 @@ export class UserManagementService {
       temporaryPassword: tempPassword,
       emailSent: false,
       message: 'New temporary password generated. Please share it manually.',
+    };
+  }
+
+  // ─── Delete student + their data ────────────────────────
+
+  /**
+   * Hard-delete a student and everything they generated.
+   *
+   * The schema's cascade-delete rules cover most of it (Enrollment,
+   * Attempt, StudentSession, ActivityLog, RecordingSegment, etc), but
+   * three @relation links from User to children DON'T have onDelete:
+   *
+   *   • StudentSourceDocument.student   → User
+   *   • DialogueSession.student         → User
+   *   • DialogueNote.student            → User
+   *
+   * Postgres' default NoAction blocks the User delete unless we clear
+   * those rows first. We also have to break the optional dialogue-
+   * session FK on LearningIntervention before deleting the dialogue
+   * sessions (the FK has no onDelete clause either).
+   *
+   * Beyond those, several biometric / interaction-log tables don't
+   * declare a Prisma @relation to User at all — they hold the user_id
+   * as a bare String. Cascade doesn't reach them because there's no FK
+   * constraint. We delete those by userId/studentId so the student's
+   * footprint is genuinely gone, not just unreachable.
+   *
+   * Everything happens in a single Prisma $transaction so a failure
+   * mid-way leaves the database untouched.
+   *
+   * Note on storage: the recording_segments rows are cascaded away,
+   * but the underlying webm blobs in MinIO are NOT removed by this
+   * call. They become orphaned objects. Cleaning the blobs requires
+   * an S3 DeleteObjects call that we deliberately leave out so the
+   * delete is atomic at the SQL layer; an offline reaper script can
+   * later sweep MinIO against the DB if disk pressure matters.
+   */
+  async deleteStudent(
+    callerId: string,
+    callerRole: string,
+    studentId: string,
+  ): Promise<{
+    deleted: { id: string; email: string; name: string };
+    rowCounts: Record<string, number>;
+  }> {
+    // Step 1 — load and validate the target.
+    const student = await this.prisma.user.findUnique({
+      where: { id: studentId },
+      select: { id: true, email: true, name: true, role: true },
+    });
+    if (!student) {
+      throw new NotFoundException('Student not found');
+    }
+    if (student.role !== 'student') {
+      // Refuse to operate on teachers / admins. Removing those needs a
+      // different flow that re-homes their courses + content.
+      throw new BadRequestException('Only student accounts can be deleted via this endpoint');
+    }
+
+    // Step 2 — authorization. Admin bypasses; otherwise teacher must
+    // own at least one course the student is enrolled in.
+    if (callerRole !== 'admin') {
+      const teacherCourses = await this.prisma.course.findMany({
+        where: { teacherId: callerId },
+        select: { id: true },
+      });
+      const courseIds = teacherCourses.map((c) => c.id);
+      if (courseIds.length === 0) {
+        throw new ForbiddenException('You do not own any courses; cannot delete students');
+      }
+      const enrollment = await this.prisma.enrollment.findFirst({
+        where: { studentId, courseId: { in: courseIds } },
+        select: { id: true },
+      });
+      if (!enrollment) {
+        throw new ForbiddenException('Student is not enrolled in any of your courses');
+      }
+    }
+
+    // Step 3 — atomic cleanup transaction.
+    const rowCounts: Record<string, number> = {};
+    await this.prisma.$transaction(async (tx) => {
+      // Break the optional FK from LearningIntervention to DialogueSession
+      // so we can delete the dialogue sessions next. The interventions
+      // themselves cascade-delete from User in step 6.
+      const interventionsCleared = await tx.learningIntervention.updateMany({
+        where: { userId: studentId, dialogueSessionId: { not: null } },
+        data: { dialogueSessionId: null },
+      });
+      rowCounts.learningInterventionsDialogueSessionFkCleared = interventionsCleared.count;
+
+      // The three @relation-to-User-without-onDelete blockers. Order:
+      // notes first (have direct studentId FK + cascade from session),
+      // then sessions (cascade messages/studio outputs/notes/etc),
+      // then the student's RAG documents.
+      rowCounts.dialogueNotes = (await tx.dialogueNote.deleteMany({ where: { studentId } })).count;
+      rowCounts.dialogueSessions = (
+        await tx.dialogueSession.deleteMany({ where: { studentId } })
+      ).count;
+      rowCounts.studentSourceDocuments = (
+        await tx.studentSourceDocument.deleteMany({ where: { studentId } })
+      ).count;
+
+      // session_sync_anchors has @relation to StudentSession with no
+      // onDelete; without this clear, the cascade-delete of
+      // StudentSession from User would fail.
+      rowCounts.sessionSyncAnchors = (
+        await tx.session_sync_anchors.deleteMany({
+          where: { userId: studentId },
+        })
+      ).count;
+
+      // Bare-userId / bare-studentId log tables (no Prisma @relation,
+      // therefore no DB FK, therefore no cascade reaches them). Wipe
+      // by hand so nothing of the student remains.
+      rowCounts.cursorLogs = (
+        await tx.cursor_logs.deleteMany({ where: { userId: studentId } })
+      ).count;
+      rowCounts.clickLogs = (
+        await tx.click_logs.deleteMany({ where: { userId: studentId } })
+      ).count;
+      rowCounts.scrollLogs = (
+        await tx.scroll_logs.deleteMany({ where: { userId: studentId } })
+      ).count;
+      rowCounts.keystrokeLogs = (
+        await tx.keystroke_logs.deleteMany({ where: { userId: studentId } })
+      ).count;
+      rowCounts.visibilityLogs = (
+        await tx.visibility_logs.deleteMany({ where: { userId: studentId } })
+      ).count;
+      rowCounts.clipboardLogs = (
+        await tx.clipboard_logs.deleteMany({ where: { userId: studentId } })
+      ).count;
+      rowCounts.viewportLogs = (
+        await tx.viewport_logs.deleteMany({ where: { userId: studentId } })
+      ).count;
+      rowCounts.performanceLogs = (
+        await tx.performance_logs.deleteMany({ where: { userId: studentId } })
+      ).count;
+      rowCounts.errorLogs = (
+        await tx.error_logs.deleteMany({ where: { userId: studentId } })
+      ).count;
+      rowCounts.derivedEngagement = (
+        await tx.derived_engagement.deleteMany({
+          where: { userId: studentId },
+        })
+      ).count;
+      rowCounts.derivedCognitiveLoad = (
+        await tx.derived_cognitive_load.deleteMany({
+          where: { userId: studentId },
+        })
+      ).count;
+      rowCounts.derivedLearningVelocity = (
+        await tx.derived_learning_velocity.deleteMany({
+          where: { userId: studentId },
+        })
+      ).count;
+      rowCounts.derivedAtRiskFlags = (
+        await tx.derived_at_risk_flags.deleteMany({
+          where: { userId: studentId },
+        })
+      ).count;
+      rowCounts.efDetections = (await tx.efDetection.deleteMany({ where: { studentId } })).count;
+      rowCounts.emotionFrames = (
+        await tx.emotionFrame.deleteMany({ where: { userId: studentId } })
+      ).count;
+      rowCounts.affectiveStateWindows = (
+        await tx.affectiveStateWindow.deleteMany({
+          where: { userId: studentId },
+        })
+      ).count;
+
+      // Step 6 — drop the User. Cascade deletes everything declared on
+      // the schema with onDelete: Cascade (enrollments, attempts,
+      // student_sessions and their children, recording_segments and
+      // their children, learning_episodes, activity_logs, masteries,
+      // interventions, llm_usage_logs, etc).
+      await tx.user.delete({ where: { id: studentId } });
+    });
+
+    this.logger.log(
+      `Deleted student ${student.id} (${student.email}) by ${callerId} (role=${callerRole})`,
+    );
+
+    return {
+      deleted: { id: student.id, email: student.email, name: student.name },
+      rowCounts,
     };
   }
 
