@@ -8,7 +8,10 @@ import {
 } from '@nestjs/common';
 import { PrismaService } from '../prisma';
 import { LlmService } from '../rag/llm.service';
-import { RagService } from '../rag/rag.service';
+// Deliberately NOT importing RagService — the dialogue path grounds
+// only on `student_rag_chunks` (the student's own uploads). Teacher
+// course-level chunks are off-limits to keep one student's
+// interventions free of any other student's material.
 import { ActivityLogService, ActivityAction } from '../activity-log';
 import { TextMiningService } from '../text-mining';
 import type { DialogueCourseSettings } from '@ats/shared';
@@ -22,7 +25,6 @@ export class DialogueService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly llmService: LlmService,
-    private readonly ragService: RagService,
     private readonly activityLogService: ActivityLogService,
     @Inject(forwardRef(() => TextMiningService))
     private readonly textMining: TextMiningService,

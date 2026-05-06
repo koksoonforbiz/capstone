@@ -22,7 +22,6 @@ import type {
   ReviewCardDto,
   ChatRequestDto,
 } from './dto';
-import { RagService } from '../rag/rag.service';
 import { DEFAULT_PROMPTS } from './prompts/default-prompts';
 import {
   buildPracticeTestingPrompt,
@@ -176,7 +175,6 @@ export class LearningInterventionsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly llmService: LlmService,
-    private readonly ragService: RagService,
     private readonly activityLogService: ActivityLogService,
   ) {}
 
@@ -337,7 +335,7 @@ export class LearningInterventionsService {
       contentId?: string;
       topic?: string;
     },
-  ): Promise<{ text: string; source: 'selection' | 'student-rag' | 'teacher-rag' }> {
+  ): Promise<{ text: string; source: 'selection' | 'student-rag' }> {
     const sel = (dto.selectedText ?? '').trim();
     if (sel.length >= 20) {
       return { text: dto.selectedText!, source: 'selection' };
@@ -363,49 +361,33 @@ export class LearningInterventionsService {
       query = course?.title ?? 'key concepts';
     }
 
-    // ─── STUDENT-RAG path ────────────────────────────────────────────
-    // The user's earlier session-bound documents are in
-    // `student_rag_chunks` (scoped by studentId + courseId, gated by
-    // `student_source_documents.is_active`). This is the same data the
-    // dialogue chat retrieves against — and the same data the studio
-    // tools (document brief, flashcards, comparison table) work on. If
-    // the student has uploaded any active source documents, we ground
-    // the intervention on those before falling back to teacher-uploaded
-    // course material.
+    // ─── STUDENT-RAG path (the only RAG path) ────────────────────────
+    // Per platform policy: dialogue-based learning grounds ONLY on the
+    // individual student's own uploaded materials. Teacher-uploaded
+    // course-level chunks (`document_chunks`) are intentionally NOT
+    // consulted here — students enrolled in the same course should
+    // never see content sourced from each other's submissions, nor
+    // from the teacher's master corpus, in their personal interventions.
+    //
+    // The student-side data lives in `student_rag_chunks`, scoped by
+    // (studentId, courseId), gated by
+    // `student_source_documents.is_active`. Same data the dialogue
+    // chat retrieves against, same data the studio tools (document
+    // brief, flashcards, comparison table) work on.
     const studentText = await this.queryStudentRagChunks(studentId, dto.courseId, query);
     if (studentText) {
       return { text: studentText, source: 'student-rag' };
     }
 
-    // ─── TEACHER-RAG fallback ────────────────────────────────────────
-    // Course-level documents uploaded by the teacher (via the
-    // course-builder ingestion flow) live in `document_chunks`.
-    const chunks = await this.ragService.queryChunks(dto.courseId, query, 5);
-    if (chunks.length === 0) {
-      // Q2 — clear error. Don't feed the LLM nothing; tell the user
-      // what's actually missing.
-      throw new BadRequestException(
-        'No indexed material available to ground this intervention. ' +
-          'Either highlight some text on the page, upload your study ' +
-          'materials in the dialogue panel, or ask your teacher to ' +
-          'upload course content (PDFs, slides, etc.).',
-      );
-    }
-
-    // Concatenate the top chunks with light formatting. Cap each chunk
-    // at ~500 chars so we don't blow the token budget on prompts that
-    // expect a short cohesive passage.
-    const MAX_CHARS = 500;
-    const text = chunks
-      .map((c, i) => {
-        const snippet =
-          c.content.length > MAX_CHARS
-            ? c.content.slice(0, MAX_CHARS).trim() + '…'
-            : c.content.trim();
-        return `[Source ${i + 1} — ${c.documentTitle}]\n${snippet}`;
-      })
-      .join('\n\n');
-    return { text, source: 'teacher-rag' };
+    // No student-uploaded chunks for this course → fail loudly. We
+    // deliberately do NOT fall back to a course-wide corpus; that
+    // would silently ground the intervention on someone else's data.
+    throw new BadRequestException(
+      'No indexed materials yet for this course. ' +
+        'Either highlight some text on the page first, or upload your ' +
+        'study materials in the dialogue panel before triggering an ' +
+        'intervention without a selection.',
+    );
   }
 
   /** Keyword-score student-uploaded chunks for this course. Mirrors the
@@ -2042,17 +2024,20 @@ export class LearningInterventionsService {
 
     const teacherId = await this.getCourseTeacherIdWithApiKey(dto.courseId);
 
-    // Retrieve relevant course material via RAG (top 3 chunks)
+    // Per dialogue-only-student-data policy: ground the chat on this
+    // student's uploaded materials only — never on teacher-side
+    // `document_chunks`, never on any other student's data. This
+    // mirrors the dialogue chat retrieval (DialogueService.
+    // retrieveStudentChunks) and the resolveInterventionContext path
+    // used by the four learning-strategy generators.
     let courseContext = '';
     try {
-      const chunks = await this.ragService.queryChunks(dto.courseId, dto.message, 3);
-      if (chunks.length > 0) {
-        courseContext =
-          '\n\nRelevant course material:\n' +
-          chunks.map((c, i) => `[${i + 1}] ${c.content.slice(0, 500)}`).join('\n\n');
+      const grounded = await this.queryStudentRagChunks(userId, dto.courseId, dto.message);
+      if (grounded) {
+        courseContext = '\n\nRelevant material from your uploads:\n' + grounded;
       }
     } catch {
-      // RAG retrieval is best-effort; continue without it
+      // Best-effort; continue without it.
     }
 
     const systemPrompt = `You are a friendly and supportive learning assistant embedded in an educational platform. Your role is to help students understand their course material and guide them to use effective learning strategies.
