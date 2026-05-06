@@ -70,6 +70,9 @@ export function PracticeTestingView({
         courseId,
         contentId: contentId || undefined,
         pageType,
+        // Q2 RAG fallback: when selectedText is empty, the backend uses
+        // `topic` to query the course's indexed materials.
+        topic: contentTitle || undefined,
         questionCount: 5,
       });
       setInterventionId(result.interventionId);

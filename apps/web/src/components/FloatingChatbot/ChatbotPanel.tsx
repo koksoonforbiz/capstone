@@ -2,6 +2,39 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { usePageContext } from '../../contexts/PageContext';
 import { api } from '../../lib/api';
+
+/**
+ * Best-effort MDX → plain-text strip for the "use entire page" intervention
+ * fallback. The original code shipped raw MDX (with `<Component/>` tags,
+ * curly-brace expressions, imports, front-matter, JSX attributes) as
+ * `selectedText`, and the LLM grounded on that markup instead of the
+ * actual content. This keeps headings + paragraph text and drops everything
+ * the LLM has no business seeing. Not a full MDX parser — it doesn't have
+ * to be; we just need a clean approximation of the visible page text.
+ */
+function stripMdxToPlainText(mdx: string): string {
+  if (!mdx) return '';
+  let s = mdx;
+  // Drop import / export statements (frontmatter-style top blocks).
+  s = s.replace(/^(?:import|export)\s+[^\n]+\n/gm, '');
+  // Drop JSX element tags (`<Foo bar="..." />`, `<Foo>`, `</Foo>`) but keep
+  // the inner text. We strip just the angle-bracketed pieces.
+  s = s.replace(/<\/?[A-Za-z][\w.-]*[^>]*>/g, '');
+  // Drop curly-brace JS expressions: `{ foo.bar }`, `{value}`. Keep
+  // multi-line ones too (non-greedy, with newlines).
+  s = s.replace(/\{[\s\S]*?\}/g, '');
+  // Drop markdown link / image syntax — keep the visible label.
+  s = s.replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1');
+  s = s.replace(/\[([^\]]+)\]\([^)]*\)/g, '$1');
+  // Drop heading hashes, list markers, blockquote angles, code fences.
+  s = s.replace(/^#{1,6}\s+/gm, '');
+  s = s.replace(/^[*\-+]\s+/gm, '');
+  s = s.replace(/^>\s+/gm, '');
+  s = s.replace(/^```[\s\S]*?```$/gm, '');
+  // Collapse runs of whitespace.
+  s = s.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n');
+  return s.trim();
+}
 import { ReviewTabView } from './ReviewTabView';
 import { PracticeTestingView } from './interventions/PracticeTestingView';
 import { InterrogativeElaborationView } from './interventions/InterrogativeElaborationView';
@@ -27,11 +60,34 @@ import {
   ArrowLeft,
 } from 'lucide-react';
 
-const STRATEGY_META: Record<string, { label: string; mode: ChatbotMode; icon: React.ReactNode; description: string }> = {
-  PRACTICE_TESTING: { label: 'Practice Testing', mode: 'practice-testing', icon: <FlaskConical size={12} />, description: 'Test your knowledge with quiz questions' },
-  DISTRIBUTED_PRACTICE: { label: 'Distributed Practice', mode: 'distributed-practice', icon: <Layers size={12} />, description: 'Create flashcards for spaced repetition' },
-  STEPWISE_LEARNING: { label: 'Stepwise Learning', mode: 'stepwise-learning', icon: <Footprints size={12} />, description: 'Break it down into guided steps' },
-  INTERROGATIVE_ELABORATION: { label: 'Interrogative Elaboration', mode: 'interrogative-elaboration', icon: <MessageCircleQuestion size={12} />, description: 'Explore why and how through Q&A' },
+const STRATEGY_META: Record<
+  string,
+  { label: string; mode: ChatbotMode; icon: React.ReactNode; description: string }
+> = {
+  PRACTICE_TESTING: {
+    label: 'Practice Testing',
+    mode: 'practice-testing',
+    icon: <FlaskConical size={12} />,
+    description: 'Test your knowledge with quiz questions',
+  },
+  DISTRIBUTED_PRACTICE: {
+    label: 'Distributed Practice',
+    mode: 'distributed-practice',
+    icon: <Layers size={12} />,
+    description: 'Create flashcards for spaced repetition',
+  },
+  STEPWISE_LEARNING: {
+    label: 'Stepwise Learning',
+    mode: 'stepwise-learning',
+    icon: <Footprints size={12} />,
+    description: 'Break it down into guided steps',
+  },
+  INTERROGATIVE_ELABORATION: {
+    label: 'Interrogative Elaboration',
+    mode: 'interrogative-elaboration',
+    icon: <MessageCircleQuestion size={12} />,
+    description: 'Explore why and how through Q&A',
+  },
 };
 
 const PAGE_TYPE_LABELS: Record<string, string> = {
@@ -50,8 +106,16 @@ interface ChatbotPanelProps {
 }
 
 export function ChatbotPanel({ onMinimize, onToggleMaximize, isMaximized }: ChatbotPanelProps) {
-  const { pageType, courseId, contentId, contentTitle, contentText, selectedText, setSelectedText, clearSelectedText } =
-    usePageContext();
+  const {
+    pageType,
+    courseId,
+    contentId,
+    contentTitle,
+    contentText,
+    selectedText,
+    setSelectedText,
+    clearSelectedText,
+  } = usePageContext();
 
   const navigate = useNavigate();
 
@@ -154,7 +218,8 @@ export function ChatbotPanel({ onMinimize, onToggleMaximize, isMaximized }: Chat
       const errorMsg: ChatMessage = {
         id: crypto.randomUUID(),
         role: 'assistant',
-        content: "Sorry, I couldn't process your message. Try selecting some text and using a learning strategy instead!",
+        content:
+          "Sorry, I couldn't process your message. Try selecting some text and using a learning strategy instead!",
         timestamp: new Date(),
       };
       setMessages((prev) => [...prev, errorMsg]);
@@ -175,9 +240,20 @@ export function ChatbotPanel({ onMinimize, onToggleMaximize, isMaximized }: Chat
   };
 
   const handleUseEntirePage = () => {
-    if (!pendingStrategy || !contentText) return;
-    setSelectedText(contentText);
-    // Small delay so context updates before the view renders
+    if (!pendingStrategy) return;
+    // Previously this set `selectedText = contentText` (raw MDX), which
+    // sent the LLM a wall of `<Component>` tags + curly braces + import
+    // statements. The LLM treated that markup as the content and
+    // produced noise about syntax — what users perceived as "random
+    // output". Strip to plain text first; if there's nothing extractable
+    // (PDF page, missing contentMdx) clear instead so the backend's
+    // Q2 RAG resolver fires against the course's uploaded materials.
+    const plain = stripMdxToPlainText(contentText ?? '');
+    if (plain.trim().length >= 20) {
+      setSelectedText(plain);
+    } else {
+      clearSelectedText();
+    }
     setTimeout(() => {
       setMode(pendingStrategy);
       setPendingStrategy(null);
@@ -385,9 +461,13 @@ export function ChatbotPanel({ onMinimize, onToggleMaximize, isMaximized }: Chat
       <div className="flex-1 overflow-y-auto p-3 space-y-3">
         {messages.length === 0 ? (
           <div className="text-center text-gray-400 text-xs py-8">
-            <div className="mb-2 flex justify-center"><GraduationCap size={28} className="text-gray-400" /></div>
+            <div className="mb-2 flex justify-center">
+              <GraduationCap size={28} className="text-gray-400" />
+            </div>
             <p>Hi! I&apos;m your learning assistant.</p>
-            <p className="mt-1">Ask me anything about your course material, or select text to use a learning strategy.</p>
+            <p className="mt-1">
+              Ask me anything about your course material, or select text to use a learning strategy.
+            </p>
           </div>
         ) : (
           messages.map((msg) => (
@@ -420,7 +500,9 @@ export function ChatbotPanel({ onMinimize, onToggleMaximize, isMaximized }: Chat
                   >
                     {STRATEGY_META[msg.suggestedStrategy]!.icon}
                     <div className="text-left">
-                      <div className="font-medium">Try: {STRATEGY_META[msg.suggestedStrategy]!.label}</div>
+                      <div className="font-medium">
+                        Try: {STRATEGY_META[msg.suggestedStrategy]!.label}
+                      </div>
                       <div className="text-[10px] opacity-75">
                         {STRATEGY_META[msg.suggestedStrategy]!.description}
                       </div>
@@ -458,7 +540,9 @@ export function ChatbotPanel({ onMinimize, onToggleMaximize, isMaximized }: Chat
                 <BookOpen size={14} />
                 <div>
                   <div className="font-medium">Use entire page content</div>
-                  <div className="text-[10px] text-blue-500">Apply to the full lesson on this page</div>
+                  <div className="text-[10px] text-blue-500">
+                    Apply to the full lesson on this page
+                  </div>
                 </div>
               </button>
             )}
@@ -469,7 +553,9 @@ export function ChatbotPanel({ onMinimize, onToggleMaximize, isMaximized }: Chat
               <TextSelect size={14} />
               <div>
                 <div className="font-medium">Select specific text first</div>
-                <div className="text-[10px] text-blue-500">Highlight text on the page, then try again</div>
+                <div className="text-[10px] text-blue-500">
+                  Highlight text on the page, then try again
+                </div>
               </div>
             </button>
           </div>
