@@ -9,12 +9,10 @@ import type {
   TimelineModality,
   TimelinePayload,
   VideoSegment,
-  MappingRuleSet,
 } from '@ats/shared';
-import { DEFAULT_MAPPING } from '@ats/shared';
 import { PrismaService } from '../../prisma/prisma.service';
 import { BlobService } from '../../blob/blob.service';
-import { MappingEngineService } from '../../affective-mapping/mapping-engine.service';
+import { AffectiveMappingService } from '../../affective-mapping/affective-mapping.service';
 
 /**
  * Stage 3 of prompt_retro/. Read-side aggregation for the teacher portal:
@@ -62,7 +60,7 @@ export class EpisodeTimelineService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly blob: BlobService,
-    private readonly mappingEngine: MappingEngineService,
+    private readonly affectiveMapping: AffectiveMappingService,
   ) {}
 
   // ─── List episodes for the picker ─────────────────────────────────────────
@@ -305,11 +303,9 @@ export class EpisodeTimelineService {
     }
     if (wants('affective_state')) {
       tasks.push(
-        this.queryAffective(sessionIds, fromMs + t0, toMs + t0, t0, episode.courseId).then(
-          (rows) => {
-            lanes.affective = rows;
-          },
-        ),
+        this.queryAffective(sessionIds, fromMs + t0, toMs + t0, t0).then((rows) => {
+          lanes.affective = rows;
+        }),
       );
     }
     if (wants('dialogue')) {
@@ -870,47 +866,53 @@ export class EpisodeTimelineService {
    * no detected face) we still return the empty result to avoid
    * recomputing on every refresh.
    */
+  /**
+   * Affective state windows for a single episode. Compute-on-read is
+   * delegated to `AffectiveMappingService.ensureWindowsForSession`,
+   * which is the same helper the per-session SessionEmotionTab
+   * endpoints call — so the retro view and the session log viewer
+   * always see the same materialised windows, no duplicate code path.
+   */
   private async queryAffective(
     sessionIds: string[],
     fromWallMs: number,
     toWallMs: number,
     t0: number,
-    courseId: string,
   ) {
     if (sessionIds.length === 0) return [];
 
-    const fetch = async () =>
-      this.prisma.affectiveStateWindow.findMany({
-        where: {
-          sessionId: { in: sessionIds },
-          windowStartWallMs: { gte: BigInt(fromWallMs), lte: BigInt(toWallMs) },
-        },
-        orderBy: { windowStartWallMs: 'asc' },
-        take: RAW_CAP,
-        select: {
-          windowStartWallMs: true,
-          windowEndWallMs: true,
-          engagement: true,
-          boredom: true,
-          confusion: true,
-          frustration: true,
-          dominantState: true,
-        },
-      });
+    // Materialise any missing windows in parallel before reading.
+    // Failures per-session are logged inside the service and don't
+    // block the rest of the timeline.
+    await Promise.all(
+      sessionIds.map((sid) =>
+        this.affectiveMapping
+          .ensureWindowsForSession(sid)
+          .catch((err) =>
+            this.logger.warn(
+              `affective ensureWindowsForSession ${sid} failed during retro render: ${err}`,
+            ),
+          ),
+      ),
+    );
 
-    let rows = await fetch();
-
-    if (rows.length === 0) {
-      // Try to compute on-demand from emotion_frames.
-      const computed = await this.computeAffectiveOnRead(sessionIds, courseId).catch((err) => {
-        this.logger.warn(`affective compute-on-read failed for course=${courseId}: ${err}`);
-        return 0;
-      });
-      if (computed > 0) {
-        rows = await fetch();
-      }
-    }
-
+    const rows = await this.prisma.affectiveStateWindow.findMany({
+      where: {
+        sessionId: { in: sessionIds },
+        windowStartWallMs: { gte: BigInt(fromWallMs), lte: BigInt(toWallMs) },
+      },
+      orderBy: { windowStartWallMs: 'asc' },
+      take: RAW_CAP,
+      select: {
+        windowStartWallMs: true,
+        windowEndWallMs: true,
+        engagement: true,
+        boredom: true,
+        confusion: true,
+        frustration: true,
+        dominantState: true,
+      },
+    });
     return rows.map((r) => ({
       startMs: Number(r.windowStartWallMs) - t0,
       endMs: Number(r.windowEndWallMs) - t0,
@@ -920,109 +922,6 @@ export class EpisodeTimelineService {
       frustration: r.frustration,
       dominantState: r.dominantState,
     }));
-  }
-
-  /**
-   * Run the AffectiveMapping engine over each session's emotion_frames
-   * and persist the resulting windows. Returns the number of windows
-   * inserted (0 means there was nothing to compute — usually because
-   * OpenFace3 hasn't run yet for these sessions).
-   */
-  private async computeAffectiveOnRead(sessionIds: string[], courseId: string): Promise<number> {
-    // Fetch (or auto-create with defaults) the course config.
-    let config = await this.prisma.affectiveMappingConfig.findUnique({
-      where: { courseId },
-    });
-    if (!config) {
-      config = await this.prisma.affectiveMappingConfig.create({
-        data: { courseId, rules: DEFAULT_MAPPING as unknown as Prisma.InputJsonValue },
-      });
-    }
-    const ruleSet = config.rules as unknown as MappingRuleSet;
-    const windowMs = config.windowSeconds * 1000;
-    const strideMs = config.strideSeconds * 1000;
-
-    let totalInserted = 0;
-
-    for (const sessionId of sessionIds) {
-      const frames = await this.prisma.emotionFrame.findMany({
-        where: { sessionId },
-        orderBy: { frameWallMs: 'asc' },
-        select: {
-          userId: true,
-          courseId: true,
-          frameWallMs: true,
-          faceDetected: true,
-          pHappiness: true,
-          pSadness: true,
-          pSurprise: true,
-          pFear: true,
-          pAnger: true,
-          pDisgust: true,
-          pContempt: true,
-          pNeutral: true,
-        },
-      });
-      if (frames.length === 0) continue;
-
-      const startWallMs = Number(frames[0]!.frameWallMs);
-      const endWallMs = Number(frames[frames.length - 1]!.frameWallMs);
-      const userId = frames[0]!.userId;
-      const frameCourseId = frames[0]!.courseId;
-
-      const toInsert: Prisma.AffectiveStateWindowCreateManyInput[] = [];
-      for (
-        let wStart = startWallMs;
-        wStart + windowMs <= endWallMs + strideMs;
-        wStart += strideMs
-      ) {
-        const wEnd = wStart + windowMs;
-        const inWindow = frames.filter((f) => {
-          const t = Number(f.frameWallMs);
-          return t >= wStart && t < wEnd;
-        });
-        if (inWindow.length === 0) continue;
-
-        const result = this.mappingEngine.computeWindow(
-          inWindow,
-          ruleSet,
-          config.minFramesPerWindow,
-        );
-        if (!result) continue;
-
-        toInsert.push({
-          sessionId,
-          userId,
-          courseId: frameCourseId,
-          configId: config.id,
-          configVersion: config.version,
-          windowStartWallMs: BigInt(wStart),
-          windowEndWallMs: BigInt(wEnd),
-          framesInWindow: inWindow.length,
-          framesWithFace: inWindow.filter((f) => f.faceDetected).length,
-          engagement: result.engagement,
-          boredom: result.boredom,
-          confusion: result.confusion,
-          frustration: result.frustration,
-          dominantState: result.dominantState,
-        });
-      }
-
-      if (toInsert.length > 0) {
-        const inserted = await this.prisma.affectiveStateWindow.createMany({
-          data: toInsert,
-          skipDuplicates: true,
-        });
-        totalInserted += inserted.count;
-      }
-    }
-
-    if (totalInserted > 0) {
-      this.logger.log(
-        `affective compute-on-read: inserted ${totalInserted} windows across ${sessionIds.length} sessions for course=${courseId}`,
-      );
-    }
-    return totalInserted;
   }
 
   /**

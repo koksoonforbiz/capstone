@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { MappingEngineService } from './mapping-engine.service';
 import { DEFAULT_MAPPING } from '@ats/shared';
@@ -94,6 +95,15 @@ export class AffectiveMappingService {
     configVersion?: number;
     limit?: number;
   }) {
+    // If the caller scoped to one session, make sure its windows have
+    // been computed at least once. Compute-on-read so single-session
+    // views don't go stale relative to the live OpenFace3 pipeline.
+    if (filters.sessionId) {
+      await this.ensureWindowsForSession(filters.sessionId).catch((err) =>
+        this.logger.warn(`ensureWindowsForSession ${filters.sessionId} failed: ${err}`),
+      );
+    }
+
     const where: Record<string, unknown> = {};
     if (filters.sessionId) where.sessionId = filters.sessionId;
     if (filters.courseId) where.courseId = filters.courseId;
@@ -112,6 +122,16 @@ export class AffectiveMappingService {
   }
 
   async getSessionSummary(sessionId: string) {
+    // Ensure the windows exist before summarising. Without this, a
+    // session whose OpenFace3 frames were just written but never
+    // pulled through the (still-not-wired) affective writer pipeline
+    // would always summarise to zeros — that's what made the user's
+    // SessionEmotionTab appear empty even though emotion_frames had
+    // hundreds of rows.
+    await this.ensureWindowsForSession(sessionId).catch((err) =>
+      this.logger.warn(`ensureWindowsForSession ${sessionId} failed: ${err}`),
+    );
+
     const windows = await this.prisma.affectiveStateWindow.findMany({
       where: { sessionId },
       orderBy: { windowStartWallMs: 'asc' },
@@ -178,6 +198,102 @@ export class AffectiveMappingService {
     );
 
     return results;
+  }
+
+  /**
+   * Idempotently materialise the affective_state_windows for a given
+   * StudentSession.
+   *
+   * The "real" pipeline that owns this is missing — the OpenFace3
+   * worker writes emotion_frames, but no service runs the mapping
+   * engine on the resulting frames. This method bridges the gap by
+   * computing windows on the first read after the frames are
+   * available, and persisting them so subsequent reads / exports /
+   * retro-tracing all hit the table directly.
+   *
+   * Returns the number of windows newly inserted (0 if either windows
+   * already exist for this session, or there are no emotion frames to
+   * compute from yet).
+   */
+  async ensureWindowsForSession(sessionId: string): Promise<number> {
+    const existing = await this.prisma.affectiveStateWindow.count({
+      where: { sessionId },
+    });
+    if (existing > 0) return 0;
+
+    const frames = await this.prisma.emotionFrame.findMany({
+      where: { sessionId },
+      orderBy: { frameWallMs: 'asc' },
+      select: {
+        userId: true,
+        courseId: true,
+        frameWallMs: true,
+        faceDetected: true,
+        pHappiness: true,
+        pSadness: true,
+        pSurprise: true,
+        pFear: true,
+        pAnger: true,
+        pDisgust: true,
+        pContempt: true,
+        pNeutral: true,
+      },
+    });
+    if (frames.length === 0) return 0;
+
+    // Resolve courseId from the first frame and load (or auto-create)
+    // the course's mapping config — this is the same path the
+    // controller's `GET /windows/:courseId` hits, just without the
+    // round-trip.
+    const courseId = frames[0]!.courseId;
+    const userId = frames[0]!.userId;
+    const config = await this.getConfig(courseId);
+    const ruleSet = config.rules as unknown as MappingRuleSet;
+    const windowMs = config.windowSeconds * 1000;
+    const strideMs = config.strideSeconds * 1000;
+
+    const startMs = Number(frames[0]!.frameWallMs);
+    const endMs = Number(frames[frames.length - 1]!.frameWallMs);
+
+    const toInsert: Prisma.AffectiveStateWindowCreateManyInput[] = [];
+    for (let wStart = startMs; wStart + windowMs <= endMs + strideMs; wStart += strideMs) {
+      const wEnd = wStart + windowMs;
+      const inWindow = frames.filter((f) => {
+        const t = Number(f.frameWallMs);
+        return t >= wStart && t < wEnd;
+      });
+      if (inWindow.length === 0) continue;
+
+      const result = this.engine.computeWindow(inWindow, ruleSet, config.minFramesPerWindow);
+      if (!result) continue;
+
+      toInsert.push({
+        sessionId,
+        userId,
+        courseId,
+        configId: config.id,
+        configVersion: config.version,
+        windowStartWallMs: BigInt(wStart),
+        windowEndWallMs: BigInt(wEnd),
+        framesInWindow: inWindow.length,
+        framesWithFace: inWindow.filter((f) => f.faceDetected).length,
+        engagement: result.engagement,
+        boredom: result.boredom,
+        confusion: result.confusion,
+        frustration: result.frustration,
+        dominantState: result.dominantState,
+      });
+    }
+
+    if (toInsert.length === 0) return 0;
+    const inserted = await this.prisma.affectiveStateWindow.createMany({
+      data: toInsert,
+      skipDuplicates: true,
+    });
+    this.logger.log(
+      `compute-on-read: inserted ${inserted.count} affective windows for session=${sessionId} course=${courseId}`,
+    );
+    return inserted.count;
   }
 
   async preview(
