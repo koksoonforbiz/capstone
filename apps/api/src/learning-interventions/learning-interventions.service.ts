@@ -329,12 +329,15 @@ export class LearningInterventionsService {
   // Caller passes the DTO. Returns a single string ready to drop into
   // {{selectedText}} in the existing prompt templates.
 
-  private async resolveInterventionContext(dto: {
-    selectedText?: string;
-    courseId: string;
-    contentId?: string;
-    topic?: string;
-  }): Promise<{ text: string; source: 'selection' | 'rag' }> {
+  private async resolveInterventionContext(
+    studentId: string,
+    dto: {
+      selectedText?: string;
+      courseId: string;
+      contentId?: string;
+      topic?: string;
+    },
+  ): Promise<{ text: string; source: 'selection' | 'student-rag' | 'teacher-rag' }> {
     const sel = (dto.selectedText ?? '').trim();
     if (sel.length >= 20) {
       return { text: dto.selectedText!, source: 'selection' };
@@ -360,15 +363,32 @@ export class LearningInterventionsService {
       query = course?.title ?? 'key concepts';
     }
 
+    // ─── STUDENT-RAG path ────────────────────────────────────────────
+    // The user's earlier session-bound documents are in
+    // `student_rag_chunks` (scoped by studentId + courseId, gated by
+    // `student_source_documents.is_active`). This is the same data the
+    // dialogue chat retrieves against — and the same data the studio
+    // tools (document brief, flashcards, comparison table) work on. If
+    // the student has uploaded any active source documents, we ground
+    // the intervention on those before falling back to teacher-uploaded
+    // course material.
+    const studentText = await this.queryStudentRagChunks(studentId, dto.courseId, query);
+    if (studentText) {
+      return { text: studentText, source: 'student-rag' };
+    }
+
+    // ─── TEACHER-RAG fallback ────────────────────────────────────────
+    // Course-level documents uploaded by the teacher (via the
+    // course-builder ingestion flow) live in `document_chunks`.
     const chunks = await this.ragService.queryChunks(dto.courseId, query, 5);
     if (chunks.length === 0) {
       // Q2 — clear error. Don't feed the LLM nothing; tell the user
       // what's actually missing.
       throw new BadRequestException(
-        'This course has no indexed material yet. ' +
-          'Either highlight some text on the page to base the intervention on, ' +
-          'or ask your teacher to upload course content (PDFs, slides, etc.) ' +
-          'before triggering an intervention without a selection.',
+        'No indexed material available to ground this intervention. ' +
+          'Either highlight some text on the page, upload your study ' +
+          'materials in the dialogue panel, or ask your teacher to ' +
+          'upload course content (PDFs, slides, etc.).',
       );
     }
 
@@ -385,7 +405,76 @@ export class LearningInterventionsService {
         return `[Source ${i + 1} — ${c.documentTitle}]\n${snippet}`;
       })
       .join('\n\n');
-    return { text, source: 'rag' };
+    return { text, source: 'teacher-rag' };
+  }
+
+  /** Keyword-score student-uploaded chunks for this course. Mirrors the
+   *  approach in dialogue.service.ts (`retrieveStudentChunks`) — same
+   *  data, same scoring shape, so an intervention triggered after a
+   *  dialogue chat sees the same grounding the chatbot just used. */
+  private async queryStudentRagChunks(
+    studentId: string,
+    courseId: string,
+    query: string,
+  ): Promise<string | null> {
+    const activeSources = await this.prisma.studentSourceDocument.findMany({
+      where: { studentId, courseId, isActive: true },
+      select: { id: true },
+    });
+    if (activeSources.length === 0) return null;
+    const sourceIds = activeSources.map((s) => s.id);
+
+    const chunks = await this.prisma.studentRagChunk.findMany({
+      where: {
+        studentId,
+        courseId,
+        documentId: { in: sourceIds },
+      },
+      include: { document: { select: { originalName: true } } },
+    });
+    if (chunks.length === 0) return null;
+
+    const queryTerms = query
+      .toLowerCase()
+      .split(/\s+/)
+      .filter((t) => t.length > 2);
+
+    const scored = chunks.map((chunk) => {
+      const contentLower = chunk.content.toLowerCase();
+      let score = 0;
+      for (const term of queryTerms) {
+        const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const matches = contentLower.match(new RegExp(escaped, 'g'));
+        score += matches ? matches.length : 0;
+      }
+      score = score / Math.sqrt(chunk.content.length / 100);
+      return {
+        documentName: chunk.document.originalName,
+        pageNumber: chunk.pageNumber,
+        content: chunk.content,
+        score,
+      };
+    });
+    scored.sort((a, b) => b.score - a.score);
+
+    // If the top score is 0 the query didn't match anything — return the
+    // top 5 chunks anyway (common case when the topic is just a course
+    // title with no overlap; we'd rather feed the LLM something the
+    // student actually uploaded than fall through to teacher RAG which
+    // is empty).
+    const top = scored.slice(0, 5);
+
+    const MAX_CHARS = 500;
+    return top
+      .map((c, i) => {
+        const snippet =
+          c.content.length > MAX_CHARS
+            ? c.content.slice(0, MAX_CHARS).trim() + '…'
+            : c.content.trim();
+        const pg = c.pageNumber !== null ? `, p.${c.pageNumber}` : '';
+        return `[Source ${i + 1} — ${c.documentName}${pg}]\n${snippet}`;
+      })
+      .join('\n\n');
   }
 
   /** Best-effort: try to map `contentId` to a human-readable string the
@@ -418,9 +507,9 @@ export class LearningInterventionsService {
     }
 
     // Resolve context: either selected text, or RAG over course material.
-    const ctx = await this.resolveInterventionContext(dto);
-    if (ctx.source === 'rag') {
-      this.logger.log(`Practice test: no selection, grounded on course material (${dto.courseId})`);
+    const ctx = await this.resolveInterventionContext(userId, dto);
+    if (ctx.source !== 'selection') {
+      this.logger.log(`Practice test: no selection, grounded on ${ctx.source} (${dto.courseId})`);
     }
 
     const teacherId = await this.getCourseTeacherIdWithApiKey(dto.courseId);
@@ -653,10 +742,10 @@ export class LearningInterventionsService {
       throw new BadRequestException('courseId is required');
     }
 
-    const ctx = await this.resolveInterventionContext(dto);
-    if (ctx.source === 'rag') {
+    const ctx = await this.resolveInterventionContext(userId, dto);
+    if (ctx.source !== 'selection') {
       this.logger.log(
-        `Interrogative elaboration: no selection, grounded on course material (${dto.courseId})`,
+        `Interrogative elaboration: no selection, grounded on ${ctx.source} (${dto.courseId})`,
       );
     }
 
@@ -923,10 +1012,10 @@ export class LearningInterventionsService {
       throw new BadRequestException('courseId is required');
     }
 
-    const ctx = await this.resolveInterventionContext(dto);
-    if (ctx.source === 'rag') {
+    const ctx = await this.resolveInterventionContext(userId, dto);
+    if (ctx.source !== 'selection') {
       this.logger.log(
-        `Stepwise learning: no selection, grounded on course material (${dto.courseId})`,
+        `Stepwise learning: no selection, grounded on ${ctx.source} (${dto.courseId})`,
       );
     }
 
@@ -1264,10 +1353,10 @@ export class LearningInterventionsService {
       throw new BadRequestException('courseId is required');
     }
 
-    const ctx = await this.resolveInterventionContext(dto);
-    if (ctx.source === 'rag') {
+    const ctx = await this.resolveInterventionContext(userId, dto);
+    if (ctx.source !== 'selection') {
       this.logger.log(
-        `Distributed practice: no selection, grounded on course material (${dto.courseId})`,
+        `Distributed practice: no selection, grounded on ${ctx.source} (${dto.courseId})`,
       );
     }
 
