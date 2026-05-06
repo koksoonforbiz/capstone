@@ -1563,6 +1563,15 @@ model RecordingSegment {
   segmentIndex  Int                   @default(0) @map("segment_index")
   uploadStatus  RecordingUploadStatus @default(PENDING) @map("upload_status")
   pyfeatJobId   String?               @map("pyfeat_job_id")
+  /// S3/MinIO multipart UploadId (Q3 streaming-upload). Persisted so a
+  /// server restart mid-session can still call CompleteMultipartUpload
+  /// or AbortMultipartUpload on the in-progress object. NULL for legacy
+  /// single-PUT segments.
+  multipartUploadId String?           @map("multipart_upload_id")
+  /// Accumulated parts list — `[{ partNumber, etag, sizeBytes }, ...]`
+  /// updated by the client after each successful UploadPart. Drives
+  /// CompleteMultipartUpload's payload at the end of the recording.
+  multipartParts    Json?             @map("multipart_parts")
   createdAt     DateTime              @default(now()) @map("created_at") @db.Timestamptz
   updatedAt     DateTime              @updatedAt @map("updated_at") @db.Timestamptz
 
