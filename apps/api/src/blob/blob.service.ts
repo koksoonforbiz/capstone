@@ -7,6 +7,11 @@ import {
   DeleteObjectCommand,
   HeadBucketCommand,
   CreateBucketCommand,
+  CreateMultipartUploadCommand,
+  UploadPartCommand,
+  CompleteMultipartUploadCommand,
+  AbortMultipartUploadCommand,
+  type CompletedPart,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 export interface PutBlobOptions {
@@ -138,6 +143,91 @@ export class BlobService implements OnModuleInit {
       expiresIn: options.expiresIn ?? 3600,
     });
     return this.toRelativePath(url);
+  }
+
+  // ─── Multipart upload (Q3 streaming webcam recording) ──────────────────
+
+  /**
+   * Start a multipart upload. Returns the `UploadId` we'll thread through
+   * subsequent UploadPart calls. The browser uploads each part directly
+   * to MinIO via presigned URLs — the API server only signs URLs and
+   * tracks the parts list, never proxies the binary data itself.
+   */
+  async createMultipartUpload(options: {
+    key: string;
+    contentType: string;
+  }): Promise<{ uploadId: string }> {
+    const result = await this.client.send(
+      new CreateMultipartUploadCommand({
+        Bucket: this.bucket,
+        Key: options.key,
+        ContentType: options.contentType,
+      }),
+    );
+    if (!result.UploadId) {
+      throw new Error('CreateMultipartUpload did not return an UploadId');
+    }
+    return { uploadId: result.UploadId };
+  }
+
+  async getPresignedUploadPartUrl(options: {
+    key: string;
+    uploadId: string;
+    partNumber: number;
+    expiresIn?: number;
+  }): Promise<string> {
+    const command = new UploadPartCommand({
+      Bucket: this.bucket,
+      Key: options.key,
+      UploadId: options.uploadId,
+      PartNumber: options.partNumber,
+    });
+    const url = await getSignedUrl(this.presignClient, command, {
+      expiresIn: options.expiresIn ?? 3600,
+    });
+    return this.toRelativePath(url);
+  }
+
+  async completeMultipartUpload(options: {
+    key: string;
+    uploadId: string;
+    parts: CompletedPart[];
+  }): Promise<void> {
+    if (options.parts.length === 0) {
+      // S3/MinIO rejects CompleteMultipartUpload with zero parts. Abort
+      // instead so we don't leave dangling state.
+      await this.abortMultipartUpload({ key: options.key, uploadId: options.uploadId });
+      throw new Error('Cannot complete multipart upload with zero parts (aborted instead)');
+    }
+    // Spec: parts must be sorted by PartNumber ascending.
+    const sorted = [...options.parts].sort((a, b) => (a.PartNumber ?? 0) - (b.PartNumber ?? 0));
+    await this.client.send(
+      new CompleteMultipartUploadCommand({
+        Bucket: this.bucket,
+        Key: options.key,
+        UploadId: options.uploadId,
+        MultipartUpload: { Parts: sorted },
+      }),
+    );
+  }
+
+  async abortMultipartUpload(options: { key: string; uploadId: string }): Promise<void> {
+    try {
+      await this.client.send(
+        new AbortMultipartUploadCommand({
+          Bucket: this.bucket,
+          Key: options.key,
+          UploadId: options.uploadId,
+        }),
+      );
+    } catch (err) {
+      // Already-aborted / completed uploads return 404 — safe to swallow.
+      this.logger.warn(
+        `AbortMultipartUpload failed for ${options.key}: ${
+          err instanceof Error ? err.message : err
+        }`,
+      );
+    }
   }
 
   /**
