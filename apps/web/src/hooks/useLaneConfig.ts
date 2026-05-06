@@ -10,6 +10,10 @@ import { useCallback, useEffect, useState } from 'react';
 
 const STORAGE_KEY = 'ats.researchLaneConfig.v1';
 
+// Engagement / cognitive-load / at-risk lanes were removed because the
+// backend writers for them are not yet in place (their derived_*
+// tables stay empty in practice). Re-add to this union when the
+// upstream pipeline lands.
 export type LaneId =
   | 'activity'
   | 'efDetection'
@@ -19,9 +23,6 @@ export type LaneId =
   | 'au'
   | 'gaze'
   | 'pupil'
-  | 'engagement'
-  | 'cognitiveLoad'
-  | 'atRisk'
   | 'click'
   | 'scroll'
   | 'visibility'
@@ -46,9 +47,6 @@ const DEFAULT_ORDER: LaneId[] = [
   'au',
   'gaze',
   'pupil',
-  'engagement',
-  'cognitiveLoad',
-  'atRisk',
   'click',
   'scroll',
   'visibility',
@@ -64,9 +62,6 @@ const DEFAULT_HEIGHTS: Record<LaneId, number> = {
   au: 56,
   gaze: 56,
   pupil: 56,
-  engagement: 44,
-  cognitiveLoad: 44,
-  atRisk: 32,
   click: 32,
   scroll: 44,
   visibility: 28,

@@ -37,7 +37,7 @@ type Props = {
   onGazeModeChange: (m: 'trace' | 'density') => void;
 };
 
-export type SelectedEventKind = 'activity' | 'efDetection' | 'atRisk' | 'error' | 'dialogue';
+export type SelectedEventKind = 'activity' | 'efDetection' | 'error' | 'dialogue';
 
 export function LaneContainer({
   payload,
@@ -82,18 +82,6 @@ export function LaneContainer({
     [lanes.efDetection],
   );
 
-  const atRiskMarkers = useMemo<EventMarker[]>(
-    () =>
-      (lanes.atRisk ?? []).map((r, i) => ({
-        id: `atrisk-${i}`,
-        tMs: r.tMs,
-        label: `risk: ${r.riskLevel}`,
-        color: riskColor(r.riskLevel),
-        payload: r,
-      })),
-    [lanes.atRisk],
-  );
-
   const errorMarkers = useMemo<EventMarker[]>(
     () =>
       (lanes.error ?? []).map((r, i) => ({
@@ -104,6 +92,20 @@ export function LaneContainer({
         payload: r,
       })),
     [lanes.error],
+  );
+
+  const dialogueMarkers = useMemo<EventMarker[]>(
+    () =>
+      (lanes.dialogue ?? []).map((r) => ({
+        id: `dlg-${r.messageId}`,
+        tMs: r.tMs,
+        label:
+          (r.role === 'USER' ? '🧑 ' : '🤖 ') +
+          (r.contentSnippet.length > 60 ? r.contentSnippet.slice(0, 57) + '…' : r.contentSnippet),
+        color: r.role === 'USER' ? 'rgb(82, 130, 145)' : 'rgb(146, 124, 90)',
+        payload: r,
+      })),
+    [lanes.dialogue],
   );
 
   const emotionSamples = useMemo<StackedSample[]>(
@@ -175,44 +177,6 @@ export function LaneContainer({
       },
     ];
   }, [lanes.pupil]);
-
-  const engagementSeries = useMemo<LineSeries[]>(() => {
-    const rows = lanes.derived?.engagement ?? [];
-    if (rows.length === 0) return [];
-    return [
-      {
-        id: 'engagement',
-        label: 'engagement',
-        color: 'rgb(82, 130, 145)',
-        points: rows.map((r) => ({
-          tMs: (r.startMs + r.endMs) / 2,
-          value: r.score,
-        })),
-        yMin: 0,
-        yMax: 1,
-        fillOpacity: 0.18,
-      },
-    ];
-  }, [lanes.derived]);
-
-  const cognitiveLoadSeries = useMemo<LineSeries[]>(() => {
-    const rows = lanes.derived?.cognitiveLoad ?? [];
-    if (rows.length === 0) return [];
-    return [
-      {
-        id: 'cognitive-load',
-        label: 'cognitive load',
-        color: 'rgb(146, 124, 90)',
-        points: rows.map((r) => ({
-          tMs: (r.startMs + r.endMs) / 2,
-          value: r.score,
-        })),
-        yMin: 0,
-        yMax: 1,
-        fillOpacity: 0.18,
-      },
-    ];
-  }, [lanes.derived]);
 
   const scrollSeries = useMemo<LineSeries[]>(() => {
     const rows = lanes.scroll ?? [];
@@ -301,12 +265,22 @@ export function LaneContainer({
           <LaneShell
             key={id}
             name="Dialogue"
-            info="Per-message dialogue events. Pending API support — see prompt_retro 03 follow-ups."
-            empty
-            emptyLabel="Dialogue lane API support deferred (Stage 3 follow-up)"
+            info="Chat messages (USER + ASSISTANT) sent during this episode."
+            empty={dialogueMarkers.length === 0}
+            legend="🧑 user · 🤖 assistant"
             {...shellProps}
           >
-            {() => null}
+            {({ width, height }) => (
+              <EventMarkerLane
+                markers={dialogueMarkers}
+                fromMs={fromMs}
+                toMs={toMs}
+                width={width}
+                height={height}
+                selectedId={selectedEventId}
+                onSelect={(m) => onSelectEvent('dialogue', m.payload, m.tMs)}
+              />
+            )}
           </LaneShell>
         );
       case 'affective':
@@ -357,9 +331,8 @@ export function LaneContainer({
           <LaneShell
             key={id}
             name="AU intensities"
-            info="OpenFace AU intensities (collapsed). Lane is empty if pyfeat-AU pipeline hasn't run for this episode."
+            info="py-feat AU intensities (18 action units). Empty until the pyfeat worker has processed at least one recording segment for this episode."
             empty={auSamples.length === 0}
-            emptyLabel="AU lane API support deferred (Stage 3 follow-up)"
             legend="18 action units"
             {...shellProps}
           >
@@ -421,70 +394,6 @@ export function LaneContainer({
                 toMs={toMs}
                 width={width}
                 height={height}
-              />
-            )}
-          </LaneShell>
-        );
-      case 'engagement':
-        return (
-          <LaneShell
-            key={id}
-            name="Engagement"
-            info="Derived engagement score (0..1) per affective window."
-            empty={engagementSeries.length === 0 || (engagementSeries[0]?.points.length ?? 0) === 0}
-            {...shellProps}
-          >
-            {({ width, height }) => (
-              <LineSeriesLane
-                series={engagementSeries}
-                fromMs={fromMs}
-                toMs={toMs}
-                width={width}
-                height={height}
-              />
-            )}
-          </LaneShell>
-        );
-      case 'cognitiveLoad':
-        return (
-          <LaneShell
-            key={id}
-            name="Cognitive load"
-            info="Derived cognitive-load score (0..1) per affective window."
-            empty={
-              cognitiveLoadSeries.length === 0 || (cognitiveLoadSeries[0]?.points.length ?? 0) === 0
-            }
-            {...shellProps}
-          >
-            {({ width, height }) => (
-              <LineSeriesLane
-                series={cognitiveLoadSeries}
-                fromMs={fromMs}
-                toMs={toMs}
-                width={width}
-                height={height}
-              />
-            )}
-          </LaneShell>
-        );
-      case 'atRisk':
-        return (
-          <LaneShell
-            key={id}
-            name="At-risk flags"
-            info="Derived-at-risk flags raised on the affective pipeline."
-            empty={atRiskMarkers.length === 0}
-            {...shellProps}
-          >
-            {({ width, height }) => (
-              <EventMarkerLane
-                markers={atRiskMarkers}
-                fromMs={fromMs}
-                toMs={toMs}
-                width={width}
-                height={height}
-                selectedId={selectedEventId}
-                onSelect={(m) => onSelectEvent('atRisk', m.payload, m.tMs)}
               />
             )}
           </LaneShell>
@@ -674,12 +583,6 @@ function efColor(label: string): string {
   if (label === 'absent') return 'rgb(180, 90, 80)';
   if (label === 'unclear') return 'rgb(146, 124, 90)';
   return 'rgb(120, 113, 108)';
-}
-
-function riskColor(level: string): string {
-  if (level === 'high') return 'rgb(220, 38, 38)';
-  if (level === 'medium') return 'rgb(217, 119, 6)';
-  return 'rgb(146, 124, 90)';
 }
 
 function affectiveColor(state: string): string {

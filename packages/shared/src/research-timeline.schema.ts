@@ -185,6 +185,19 @@ export const ErrorRowSchema = z.object({
   errorType: z.string().nullable(),
 });
 
+/**
+ * One marker per chat message (USER or ASSISTANT) sent during the
+ * episode's time window. Lets researchers correlate dialogue rhythm
+ * with biometric and EF-detection lanes on the same x-axis.
+ */
+export const DialogueRowSchema = z.object({
+  tMs: z.number(),
+  messageId: z.string(),
+  role: z.string(), // 'USER' | 'ASSISTANT'
+  contentSnippet: z.string(),
+  dialogueSessionId: z.string(),
+});
+
 export const TimelineLanesSchema = z.object({
   activity: z.array(ActivityRowSchema).optional(),
   gaze: z.array(GazeRowSchema).optional(),
@@ -205,6 +218,7 @@ export const TimelineLanesSchema = z.object({
   cursor: z.array(CursorRowSchema).optional(),
   visibility: z.array(VisibilityRowSchema).optional(),
   error: z.array(ErrorRowSchema).optional(),
+  dialogue: z.array(DialogueRowSchema).optional(),
 });
 export type TimelineLanes = z.infer<typeof TimelineLanesSchema>;
 
@@ -254,5 +268,6 @@ export const TIMELINE_MODALITIES = [
   'error',
   'affective_state',
   'at_risk',
+  'dialogue',
 ] as const;
 export type TimelineModality = (typeof TIMELINE_MODALITIES)[number];

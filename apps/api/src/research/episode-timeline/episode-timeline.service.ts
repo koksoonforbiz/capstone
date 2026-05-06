@@ -9,9 +9,12 @@ import type {
   TimelineModality,
   TimelinePayload,
   VideoSegment,
+  MappingRuleSet,
 } from '@ats/shared';
+import { DEFAULT_MAPPING } from '@ats/shared';
 import { PrismaService } from '../../prisma/prisma.service';
 import { BlobService } from '../../blob/blob.service';
+import { MappingEngineService } from '../../affective-mapping/mapping-engine.service';
 
 /**
  * Stage 3 of prompt_retro/. Read-side aggregation for the teacher portal:
@@ -59,6 +62,7 @@ export class EpisodeTimelineService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly blob: BlobService,
+    private readonly mappingEngine: MappingEngineService,
   ) {}
 
   // ─── List episodes for the picker ─────────────────────────────────────────
@@ -291,10 +295,29 @@ export class EpisodeTimelineService {
         }),
       );
     }
+    if (wants('au')) {
+      tasks.push(
+        this.queryAu(sessionIds, fromMs + t0, toMs + t0, t0).then((rows) => {
+          if (rows.length === RAW_CAP) truncatedLanes.push({ lane: 'au', capHit: RAW_CAP });
+          lanes.au = rows;
+        }),
+      );
+    }
     if (wants('affective_state')) {
       tasks.push(
-        this.queryAffective(sessionIds, fromMs + t0, toMs + t0, t0).then((rows) => {
-          lanes.affective = rows;
+        this.queryAffective(sessionIds, fromMs + t0, toMs + t0, t0, episode.courseId).then(
+          (rows) => {
+            lanes.affective = rows;
+          },
+        ),
+      );
+    }
+    if (wants('dialogue')) {
+      tasks.push(
+        this.queryDialogue(sessionIds, fromMs + t0, toMs + t0, t0).then((rows) => {
+          if (rows.length === EVENT_CAP)
+            truncatedLanes.push({ lane: 'dialogue', capHit: EVENT_CAP });
+          lanes.dialogue = rows;
         }),
       );
     }
@@ -435,8 +458,10 @@ export class EpisodeTimelineService {
       gaze,
       pupil,
       emotion,
+      au,
       affective,
       efDetection,
+      dialogue,
       click,
       scroll,
       cursor,
@@ -448,8 +473,10 @@ export class EpisodeTimelineService {
       this.prisma.webgazerLog.count({ where: { sessionId: { in: sessionIds } } }),
       this.prisma.pupilSizeLog.count({ where: { sessionId: { in: sessionIds } } }),
       this.prisma.emotionFrame.count({ where: { sessionId: { in: sessionIds } } }),
+      this.prisma.pyfeatAuResult.count({ where: { job: { sessionId: { in: sessionIds } } } }),
       this.prisma.affectiveStateWindow.count({ where: { sessionId: { in: sessionIds } } }),
       this.prisma.efDetection.count({ where: { studentSessionId: { in: sessionIds } } }),
+      this.countDialogueMessages(sessionIds),
       this.prisma.click_logs.count({ where: { sessionId: { in: sessionIds } } }),
       this.prisma.scroll_logs.count({ where: { sessionId: { in: sessionIds } } }),
       this.prisma.cursor_logs.count({ where: { sessionId: { in: sessionIds } } }),
@@ -462,8 +489,10 @@ export class EpisodeTimelineService {
       gaze,
       pupil,
       emotion,
+      au,
       affective,
       efDetection,
+      dialogue,
       click,
       scroll,
       cursor,
@@ -471,6 +500,40 @@ export class EpisodeTimelineService {
       error: errors,
       atRisk,
     };
+  }
+
+  /**
+   * Count of dialogue messages within these StudentSessions' time
+   * windows. There's no FK from dialogue_messages to student_sessions,
+   * so we resolve via (studentId, courseId) — same logic as
+   * `queryDialogue`. Used by the per-lane count summary.
+   */
+  private async countDialogueMessages(sessionIds: string[]): Promise<number> {
+    if (sessionIds.length === 0) return 0;
+    const sessions = await this.prisma.studentSession.findMany({
+      where: { id: { in: sessionIds } },
+      select: { userId: true, courseId: true, startedAt: true, endedAt: true },
+    });
+    if (sessions.length === 0) return 0;
+    const userIds = [...new Set(sessions.map((s) => s.userId))];
+    const courseIds = [...new Set(sessions.map((s) => s.courseId).filter((c): c is string => !!c))];
+    const startedAt = sessions.reduce(
+      (min, s) => (s.startedAt < min ? s.startedAt : min),
+      sessions[0]!.startedAt,
+    );
+    const endedAt = sessions.reduce<Date>(
+      (max, s) => (s.endedAt && s.endedAt > max ? s.endedAt : max),
+      sessions[0]!.endedAt ?? sessions[0]!.startedAt,
+    );
+    return this.prisma.dialogueMessage.count({
+      where: {
+        session: {
+          studentId: { in: userIds },
+          ...(courseIds.length > 0 ? { courseId: { in: courseIds } } : {}),
+        },
+        createdAt: { gte: startedAt, lte: endedAt },
+      },
+    });
   }
 
   private async countAtRiskByEpisode(episodeIds: string[]) {
@@ -791,30 +854,63 @@ export class EpisodeTimelineService {
     }));
   }
 
+  /**
+   * Affective state windows for a single episode. The full pipeline
+   * (OpenFace3 worker → emotion_frames; affective-mapping engine →
+   * affective_state_windows) currently writes only the first half —
+   * no service runs the engine on completion of an OpenFace3 job.
+   *
+   * To unblock the retro-tracing UI, this method does compute-on-read:
+   * if no rows exist for the requested sessions but emotion_frames
+   * are present, we fetch the course's MappingConfig (auto-creating
+   * one with the default rules if missing), slide a window over the
+   * frames per session, run the engine, persist the windows so
+   * subsequent reads / exports hit the table directly, then return
+   * them. If the engine produces zero windows (e.g. all frames have
+   * no detected face) we still return the empty result to avoid
+   * recomputing on every refresh.
+   */
   private async queryAffective(
     sessionIds: string[],
     fromWallMs: number,
     toWallMs: number,
     t0: number,
+    courseId: string,
   ) {
     if (sessionIds.length === 0) return [];
-    const rows = await this.prisma.affectiveStateWindow.findMany({
-      where: {
-        sessionId: { in: sessionIds },
-        windowStartWallMs: { gte: BigInt(fromWallMs), lte: BigInt(toWallMs) },
-      },
-      orderBy: { windowStartWallMs: 'asc' },
-      take: RAW_CAP,
-      select: {
-        windowStartWallMs: true,
-        windowEndWallMs: true,
-        engagement: true,
-        boredom: true,
-        confusion: true,
-        frustration: true,
-        dominantState: true,
-      },
-    });
+
+    const fetch = async () =>
+      this.prisma.affectiveStateWindow.findMany({
+        where: {
+          sessionId: { in: sessionIds },
+          windowStartWallMs: { gte: BigInt(fromWallMs), lte: BigInt(toWallMs) },
+        },
+        orderBy: { windowStartWallMs: 'asc' },
+        take: RAW_CAP,
+        select: {
+          windowStartWallMs: true,
+          windowEndWallMs: true,
+          engagement: true,
+          boredom: true,
+          confusion: true,
+          frustration: true,
+          dominantState: true,
+        },
+      });
+
+    let rows = await fetch();
+
+    if (rows.length === 0) {
+      // Try to compute on-demand from emotion_frames.
+      const computed = await this.computeAffectiveOnRead(sessionIds, courseId).catch((err) => {
+        this.logger.warn(`affective compute-on-read failed for course=${courseId}: ${err}`);
+        return 0;
+      });
+      if (computed > 0) {
+        rows = await fetch();
+      }
+    }
+
     return rows.map((r) => ({
       startMs: Number(r.windowStartWallMs) - t0,
       endMs: Number(r.windowEndWallMs) - t0,
@@ -823,6 +919,220 @@ export class EpisodeTimelineService {
       confusion: r.confusion,
       frustration: r.frustration,
       dominantState: r.dominantState,
+    }));
+  }
+
+  /**
+   * Run the AffectiveMapping engine over each session's emotion_frames
+   * and persist the resulting windows. Returns the number of windows
+   * inserted (0 means there was nothing to compute — usually because
+   * OpenFace3 hasn't run yet for these sessions).
+   */
+  private async computeAffectiveOnRead(sessionIds: string[], courseId: string): Promise<number> {
+    // Fetch (or auto-create with defaults) the course config.
+    let config = await this.prisma.affectiveMappingConfig.findUnique({
+      where: { courseId },
+    });
+    if (!config) {
+      config = await this.prisma.affectiveMappingConfig.create({
+        data: { courseId, rules: DEFAULT_MAPPING as unknown as Prisma.InputJsonValue },
+      });
+    }
+    const ruleSet = config.rules as unknown as MappingRuleSet;
+    const windowMs = config.windowSeconds * 1000;
+    const strideMs = config.strideSeconds * 1000;
+
+    let totalInserted = 0;
+
+    for (const sessionId of sessionIds) {
+      const frames = await this.prisma.emotionFrame.findMany({
+        where: { sessionId },
+        orderBy: { frameWallMs: 'asc' },
+        select: {
+          userId: true,
+          courseId: true,
+          frameWallMs: true,
+          faceDetected: true,
+          pHappiness: true,
+          pSadness: true,
+          pSurprise: true,
+          pFear: true,
+          pAnger: true,
+          pDisgust: true,
+          pContempt: true,
+          pNeutral: true,
+        },
+      });
+      if (frames.length === 0) continue;
+
+      const startWallMs = Number(frames[0]!.frameWallMs);
+      const endWallMs = Number(frames[frames.length - 1]!.frameWallMs);
+      const userId = frames[0]!.userId;
+      const frameCourseId = frames[0]!.courseId;
+
+      const toInsert: Prisma.AffectiveStateWindowCreateManyInput[] = [];
+      for (
+        let wStart = startWallMs;
+        wStart + windowMs <= endWallMs + strideMs;
+        wStart += strideMs
+      ) {
+        const wEnd = wStart + windowMs;
+        const inWindow = frames.filter((f) => {
+          const t = Number(f.frameWallMs);
+          return t >= wStart && t < wEnd;
+        });
+        if (inWindow.length === 0) continue;
+
+        const result = this.mappingEngine.computeWindow(
+          inWindow,
+          ruleSet,
+          config.minFramesPerWindow,
+        );
+        if (!result) continue;
+
+        toInsert.push({
+          sessionId,
+          userId,
+          courseId: frameCourseId,
+          configId: config.id,
+          configVersion: config.version,
+          windowStartWallMs: BigInt(wStart),
+          windowEndWallMs: BigInt(wEnd),
+          framesInWindow: inWindow.length,
+          framesWithFace: inWindow.filter((f) => f.faceDetected).length,
+          engagement: result.engagement,
+          boredom: result.boredom,
+          confusion: result.confusion,
+          frustration: result.frustration,
+          dominantState: result.dominantState,
+        });
+      }
+
+      if (toInsert.length > 0) {
+        const inserted = await this.prisma.affectiveStateWindow.createMany({
+          data: toInsert,
+          skipDuplicates: true,
+        });
+        totalInserted += inserted.count;
+      }
+    }
+
+    if (totalInserted > 0) {
+      this.logger.log(
+        `affective compute-on-read: inserted ${totalInserted} windows across ${sessionIds.length} sessions for course=${courseId}`,
+      );
+    }
+    return totalInserted;
+  }
+
+  /**
+   * AU intensities lane. py-feat writes per-frame AU values to
+   * `pyfeat_au_results` keyed by `jobId`; we join through `pyfeat_jobs`
+   * to scope by sessionId. Each row is collapsed into a single
+   * `aus` map matching the lane's stacked-area renderer.
+   */
+  private async queryAu(sessionIds: string[], fromWallMs: number, toWallMs: number, t0: number) {
+    if (sessionIds.length === 0) return [];
+    const rows = await this.prisma.pyfeatAuResult.findMany({
+      where: {
+        job: { sessionId: { in: sessionIds } },
+        wallTime: { gte: new Date(fromWallMs), lte: new Date(toWallMs) },
+      },
+      orderBy: { wallTime: 'asc' },
+      take: RAW_CAP,
+      select: {
+        wallTime: true,
+        au01: true,
+        au02: true,
+        au04: true,
+        au05: true,
+        au06: true,
+        au07: true,
+        au09: true,
+        au10: true,
+        au12: true,
+        au14: true,
+        au15: true,
+        au17: true,
+        au20: true,
+        au23: true,
+        au24: true,
+        au25: true,
+        au26: true,
+        au28: true,
+      },
+    });
+    return rows.map((r) => ({
+      tMs: r.wallTime.getTime() - t0,
+      aus: {
+        AU01: r.au01,
+        AU02: r.au02,
+        AU04: r.au04,
+        AU05: r.au05,
+        AU06: r.au06,
+        AU07: r.au07,
+        AU09: r.au09,
+        AU10: r.au10,
+        AU12: r.au12,
+        AU14: r.au14,
+        AU15: r.au15,
+        AU17: r.au17,
+        AU20: r.au20,
+        AU23: r.au23,
+        AU24: r.au24,
+        AU25: r.au25,
+        AU26: r.au26,
+        AU28: r.au28,
+      },
+    }));
+  }
+
+  /**
+   * Dialogue lane: every chat message (USER + ASSISTANT) sent during
+   * the episode's time window. There is no FK from dialogue_messages
+   * to student_sessions, so we resolve by (studentId, courseId) +
+   * createdAt window — episodes are scoped to a single course, and
+   * the StudentSession records carry both fields.
+   */
+  private async queryDialogue(
+    sessionIds: string[],
+    fromWallMs: number,
+    toWallMs: number,
+    t0: number,
+  ) {
+    if (sessionIds.length === 0) return [];
+    const sessions = await this.prisma.studentSession.findMany({
+      where: { id: { in: sessionIds } },
+      select: { userId: true, courseId: true },
+    });
+    if (sessions.length === 0) return [];
+    const userIds = [...new Set(sessions.map((s) => s.userId))];
+    const courseIds = [...new Set(sessions.map((s) => s.courseId).filter((c): c is string => !!c))];
+
+    const messages = await this.prisma.dialogueMessage.findMany({
+      where: {
+        session: {
+          studentId: { in: userIds },
+          ...(courseIds.length > 0 ? { courseId: { in: courseIds } } : {}),
+        },
+        createdAt: { gte: new Date(fromWallMs), lte: new Date(toWallMs) },
+      },
+      orderBy: { createdAt: 'asc' },
+      take: EVENT_CAP,
+      select: {
+        id: true,
+        role: true,
+        content: true,
+        createdAt: true,
+        sessionId: true,
+      },
+    });
+    return messages.map((m) => ({
+      tMs: m.createdAt.getTime() - t0,
+      messageId: m.id,
+      role: m.role,
+      contentSnippet: m.content.slice(0, 200),
+      dialogueSessionId: m.sessionId,
     }));
   }
 
