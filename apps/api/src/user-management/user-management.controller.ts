@@ -3,12 +3,12 @@ import {
   Get,
   Post,
   Put,
+  Delete,
   Query,
   Param,
   Body,
   Request,
   UseGuards,
-  Header,
   Res,
 } from '@nestjs/common';
 import type { Response } from 'express';
@@ -97,6 +97,33 @@ export class UserManagementController {
     @Param('studentId') studentId: string,
   ) {
     return this.service.resendInvitation(req.user.id, studentId);
+  }
+
+  /**
+   * Hard-delete a student account and all of their data.
+   *
+   * Authorization:
+   *   - Admin: may delete any student.
+   *   - Teacher: may delete a student only if the student is enrolled in
+   *     at least one course the teacher owns. (Same scoping rule as the
+   *     other student-management endpoints.)
+   *
+   * The endpoint refuses to operate on non-student accounts — this is a
+   * student-cleanup tool, not a generic user deletion. Admin accounts
+   * and teacher accounts must be removed through a separate flow.
+   *
+   * The body of the response lists the row counts removed per table so
+   * the UI can show an audit summary. The deletion is wrapped in a
+   * single Postgres transaction; any constraint failure rolls back the
+   * whole thing and the student remains intact.
+   */
+  @Delete('students/:studentId')
+  @Roles('teacher', 'admin')
+  async deleteStudent(
+    @Request() req: { user: RequestUser },
+    @Param('studentId') studentId: string,
+  ) {
+    return this.service.deleteStudent(req.user.id, req.user.role, studentId);
   }
 
   // ─── Teacher Usage ────────────────────────────────────
