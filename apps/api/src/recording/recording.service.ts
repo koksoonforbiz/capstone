@@ -79,20 +79,37 @@ export class RecordingService {
     });
   }
 
-  async initiateSegment(
+  /**
+   * Cross-student-leak guard for recording-segment creation, with
+   * built-in tolerance for the legitimate race between the client's
+   * `PATCH /activity-log/session/course` and the recording start.
+   *
+   * The race: when a student enters a course page, both fire in parallel
+   *   1. PATCH /session/course      → setCourseId(session, courseId)
+   *   2. POST /recording/segments/initiate-multipart  → this method
+   *
+   * If (2) lands at the server before (1)'s UPDATE commits, the session
+   * still has `courseId IS NULL`. The strict guard would reject with
+   * 400 "courseId does not match the session's course" and the recorder
+   * shows the bug as "video not recorded" (confirmed in the wild on
+   * 2026-05-06 for a freshly-registered student).
+   *
+   * Resolution:
+   *   • If the session has courseId=NULL → patch it to dto.courseId
+   *     here and proceed. This is exactly the operation /session/course
+   *     would have done.
+   *   • If the session has a courseId that disagrees with dto.courseId
+   *     → reject as before. (cross-student leak surface)
+   *   • All other guards (userId match, session not ended, session
+   *     exists) are unchanged.
+   */
+  private async assertSessionOwnsCourseOrPatch(
     studentId: string,
-    dto: CreateSegmentDto,
-  ): Promise<{ segmentId: string; uploadUrl: string; minioKey: string }> {
-    // SECURITY (cross-student leak hotfix): the client passes `sessionId`
-    // and `courseId`, but we MUST verify they belong to the requesting
-    // student. Otherwise a stale `sessionStorage['ats_session_id']` (e.g.
-    // shared classroom computer, race during logout cleanup) could land
-    // someone else's webcam segment in this user's session — and the
-    // teacher's retrospective-tracing view would then show another
-    // student's video. Confirmed in the wild: 2 mis-bound rows existed
-    // before this guard. Reject anything that doesn't match.
+    sessionId: string,
+    courseId: string,
+  ): Promise<void> {
     const session = await this.prisma.studentSession.findUnique({
-      where: { id: dto.sessionId },
+      where: { id: sessionId },
       select: { id: true, userId: true, courseId: true, endedAt: true },
     });
     if (!session) {
@@ -101,14 +118,34 @@ export class RecordingService {
     if (session.userId !== studentId) {
       throw new ForbiddenException('Session does not belong to the requesting user');
     }
-    if (session.courseId !== dto.courseId) {
-      throw new BadRequestException("courseId does not match the session's course");
-    }
     if (session.endedAt) {
       throw new BadRequestException(
         'Session has already ended; refusing to attach a recording segment',
       );
     }
+    if (session.courseId === null) {
+      // Race-tolerant patch — the /session/course PATCH from the
+      // BiometricsSyncContext just hasn't landed yet. Apply the same
+      // operation here so the recording can proceed.
+      await this.prisma.studentSession.update({
+        where: { id: sessionId },
+        data: { courseId },
+      });
+      this.logger.log(
+        `Session ${sessionId}: patched courseId=${courseId} during recording-initiate (PATCH /session/course race)`,
+      );
+      return;
+    }
+    if (session.courseId !== courseId) {
+      throw new BadRequestException("courseId does not match the session's course");
+    }
+  }
+
+  async initiateSegment(
+    studentId: string,
+    dto: CreateSegmentDto,
+  ): Promise<{ segmentId: string; uploadUrl: string; minioKey: string }> {
+    await this.assertSessionOwnsCourseOrPatch(studentId, dto.sessionId, dto.courseId);
 
     const now = new Date(dto.startWallTime);
     const dateStr = now.toISOString().slice(0, 10); // YYYY-MM-DD
@@ -241,23 +278,7 @@ export class RecordingService {
     studentId: string,
     dto: CreateSegmentDto,
   ): Promise<{ segmentId: string; uploadId: string; minioKey: string }> {
-    // Same cross-student-leak guard as the single-PUT path.
-    const session = await this.prisma.studentSession.findUnique({
-      where: { id: dto.sessionId },
-      select: { id: true, userId: true, courseId: true, endedAt: true },
-    });
-    if (!session) throw new NotFoundException('Session not found');
-    if (session.userId !== studentId) {
-      throw new ForbiddenException('Session does not belong to the requesting user');
-    }
-    if (session.courseId !== dto.courseId) {
-      throw new BadRequestException("courseId does not match the session's course");
-    }
-    if (session.endedAt) {
-      throw new BadRequestException(
-        'Session has already ended; refusing to attach a recording segment',
-      );
-    }
+    await this.assertSessionOwnsCourseOrPatch(studentId, dto.sessionId, dto.courseId);
 
     const now = new Date(dto.startWallTime);
     const dateStr = now.toISOString().slice(0, 10);
