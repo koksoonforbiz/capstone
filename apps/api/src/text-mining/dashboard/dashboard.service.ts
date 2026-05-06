@@ -2,20 +2,59 @@ import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { CONSTRUCTS } from '../detection/constructs';
 
+/**
+ * StudentSession ids are UUIDs (`uuid()` from Prisma); DialogueSession
+ * ids are cuids (`cuid()`). The two spaces are disjoint, so the
+ * format alone is enough to tell which kind of id was passed.
+ *
+ * The teacher's live chat-thread dashboard passes a DialogueSession.id
+ * (it's scoped to one chat); the SessionTimelinePage passes a
+ * StudentSession.id (it's scoped to one login session, possibly
+ * spanning multiple chats). Routing on id-format means both views can
+ * share the endpoint without an explicit query param.
+ */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function isStudentSessionId(id: string): boolean {
+  return UUID_RE.test(id);
+}
+
 @Injectable()
 export class DashboardService {
   constructor(private readonly prisma: PrismaService) {}
 
   async getSessionDashboard(sessionId: string, rollingN: number) {
-    const totalUserMessages = await this.prisma.dialogueMessage.count({
-      where: { sessionId, role: 'USER' },
-    });
+    const isStudentSession = isStudentSessionId(sessionId);
+
+    // Build the EF-detection scope filter. For StudentSession.id we
+    // query on the new `studentSessionId` column populated by the
+    // dialogue → text-mining wiring; for DialogueSession.id we query
+    // on the original `sessionId` column.
+    const efScope = isStudentSession
+      ? ({ studentSessionId: sessionId } as const)
+      : ({ sessionId } as const);
+
+    // Count of user messages that drove EF processing in this scope.
+    // For DialogueSession.id we can count dialogue_messages directly;
+    // for StudentSession.id we count distinct messageIds across the
+    // EF detections (each user message produces a fan-out of one row
+    // per construct, dedupe to get the message count).
+    const totalUserMessages = isStudentSession
+      ? (
+          await this.prisma.efDetection.findMany({
+            where: { studentSessionId: sessionId },
+            select: { messageId: true },
+            distinct: ['messageId'],
+          })
+        ).length
+      : await this.prisma.dialogueMessage.count({
+          where: { sessionId, role: 'USER' },
+        });
 
     const constructs: Record<string, unknown> = {};
 
     for (const c of CONSTRUCTS) {
       const allDetections = await this.prisma.efDetection.findMany({
-        where: { sessionId, constructKey: c.key, label: { notIn: ['error', 'pending'] } },
+        where: { ...efScope, constructKey: c.key, label: { notIn: ['error', 'pending'] } },
         orderBy: { createdAt: 'desc' },
       });
 
@@ -25,10 +64,10 @@ export class DashboardService {
 
       const disabled = allDetections.length === 0 && totalUserMessages > 0;
       const errorCount = await this.prisma.efDetection.count({
-        where: { sessionId, constructKey: c.key, label: 'error' },
+        where: { ...efScope, constructKey: c.key, label: 'error' },
       });
       const pendingCount = await this.prisma.efDetection.count({
-        where: { sessionId, constructKey: c.key, label: 'pending' },
+        where: { ...efScope, constructKey: c.key, label: 'pending' },
       });
 
       let rolling: unknown;
@@ -92,7 +131,11 @@ export class DashboardService {
     sessionId: string,
     filters: { constructKey?: string; label?: string; cursor?: string; limit: number },
   ) {
-    const where: Record<string, unknown> = { sessionId };
+    // Same routing logic as `getSessionDashboard`: UUID → student-
+    // session scope, cuid → dialogue-session scope.
+    const where: Record<string, unknown> = isStudentSessionId(sessionId)
+      ? { studentSessionId: sessionId }
+      : { sessionId };
     if (filters.constructKey) where.constructKey = filters.constructKey;
     if (filters.label) where.label = filters.label;
     if (filters.cursor) where.id = { lt: filters.cursor };

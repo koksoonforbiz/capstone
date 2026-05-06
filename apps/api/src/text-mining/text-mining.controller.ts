@@ -76,8 +76,14 @@ export class TextMiningController {
   @Get('sessions/:sessionId/detections.csv')
   @Roles('teacher', 'admin')
   async getDetectionsCsv(@Param('sessionId') sessionId: string, @Res() res: Response) {
+    // Same dual-id routing as the dashboard JSON endpoint: a UUID
+    // means StudentSession.id (query the new column), anything else
+    // (cuid in practice) means DialogueSession.id.
+    const isStudentSession = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      sessionId,
+    );
     const detections = await this.prisma.efDetection.findMany({
-      where: { sessionId },
+      where: isStudentSession ? { studentSessionId: sessionId } : { sessionId },
       orderBy: { createdAt: 'asc' },
     });
 
