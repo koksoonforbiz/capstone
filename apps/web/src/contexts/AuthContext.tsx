@@ -1,4 +1,12 @@
-import { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from 'react';
+import {
+  createContext,
+  useContext,
+  useState,
+  useEffect,
+  useCallback,
+  useRef,
+  type ReactNode,
+} from 'react';
 import { api } from '../lib/api';
 import { joinStudentRoom, disconnectSocket } from '../lib/socket';
 import { initActivitySession, clearActivitySession } from '../lib/activity-log';
@@ -40,6 +48,17 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+  // Synchronous guard so React 18 StrictMode's double-invocation of mount
+  // effects can't race a duplicate `/activity-log/session/open` POST. Both
+  // invocations would see `sessionStorage` empty before either response
+  // lands, so without this we'd create two StudentSession rows for the
+  // same login. The dual-session bug then trickles down: the second
+  // session's PATCH /session/course writes courseId onto whichever
+  // session's open-response won the race, leaving the other naked → the
+  // recording-initiate guard rejects with "courseId does not match the
+  // session's course" and no video is recorded. (PR-#19 cross-student
+  // hotfix is doing its job; the bug is here.)
+  const sessionOpenInFlightRef = useRef(false);
 
   // Load user from token on mount
   useEffect(() => {
@@ -56,7 +75,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           joinStudentRoom(parsedUser.id);
 
           // If no activity session exists in sessionStorage, open a new one
-          if (!sessionStorage.getItem('ats_session_id')) {
+          if (!sessionStorage.getItem('ats_session_id') && !sessionOpenInFlightRef.current) {
+            sessionOpenInFlightRef.current = true;
             api
               .post<{ sessionId: string }>('/activity-log/session/open')
               .then((res) => {
@@ -66,6 +86,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
               })
               .catch(() => {
                 // Non-critical — activity logging will be skipped
+              })
+              .finally(() => {
+                // Don't reset the ref. If we resolved, sessionStorage is
+                // populated; if we failed, retrying on another mount
+                // invocation would be the same race. The ref persists
+                // for the lifetime of this provider, which is fine —
+                // logout()/clearActivitySession clears sessionStorage
+                // and the next genuine mount (after re-render or HMR)
+                // gets a fresh ref.
               });
           }
         }
