@@ -449,7 +449,7 @@ export class EpisodeTimelineService {
       this.prisma.pupilSizeLog.count({ where: { sessionId: { in: sessionIds } } }),
       this.prisma.emotionFrame.count({ where: { sessionId: { in: sessionIds } } }),
       this.prisma.affectiveStateWindow.count({ where: { sessionId: { in: sessionIds } } }),
-      this.prisma.efDetection.count({ where: { sessionId: { in: sessionIds } } }),
+      this.prisma.efDetection.count({ where: { studentSessionId: { in: sessionIds } } }),
       this.prisma.click_logs.count({ where: { sessionId: { in: sessionIds } } }),
       this.prisma.scroll_logs.count({ where: { sessionId: { in: sessionIds } } }),
       this.prisma.cursor_logs.count({ where: { sessionId: { in: sessionIds } } }),
@@ -828,9 +828,13 @@ export class EpisodeTimelineService {
 
   private async queryEfDetection(sessionIds: string[], fromWall: Date, toWall: Date, t0: number) {
     if (sessionIds.length === 0) return [];
+    // Retro-tracing keys every lane by StudentSession.id. EF detections
+    // historically wrote DialogueSession.id into `sessionId` (used by the
+    // live teacher dashboard); the new `studentSessionId` column carries
+    // the activity-session id so the two views can coexist.
     const rows = await this.prisma.efDetection.findMany({
       where: {
-        sessionId: { in: sessionIds },
+        studentSessionId: { in: sessionIds },
         createdAt: { gte: fromWall, lte: toWall },
         label: { not: 'pending' },
       },
