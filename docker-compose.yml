@@ -17,7 +17,15 @@ services:
       BLOB_STORAGE_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
       BLOB_STORAGE_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
       BLOB_STORAGE_REGION: us-east-1
-      BLOB_STORAGE_PUBLIC_ENDPOINT: http://localhost:${MINIO_API_PORT:-9000}
+      # Must match the Host the Vite dev proxy actually forwards to
+      # MinIO. With `changeOrigin: true` on the /s3 proxy the upstream
+      # Host header becomes `minio:9000`; signing URLs against
+      # `localhost:9000` makes the SigV4 host check fail and MinIO
+      # drops the connection (visible as `write ECONNRESET` in vite
+      # logs). `toRelativePath()` strips the host back to `/s3/<path>`
+      # before the browser ever sees it, so this value is purely a
+      # signing input.
+      BLOB_STORAGE_PUBLIC_ENDPOINT: http://minio:9000
     networks:
       - local-dev
     depends_on:
