@@ -1,5 +1,6 @@
 """Core AU extraction logic using py-feat."""
 
+import json
 import os
 import uuid
 import tempfile
@@ -112,7 +113,10 @@ def process_job(job: dict) -> str:
             if "FaceScore" in row:
                 face_conf = float(row["FaceScore"]) if pd.notna(row["FaceScore"]) else None
             if all(k in row for k in ["FaceRectX", "FaceRectY", "FaceRectWidth", "FaceRectHeight"]):
-                face_box = str({
+                # Use json.dumps — str(dict) emits Python-repr with single
+                # quotes ({'x': 1}), which Postgres rejects when casting
+                # the value into the JSON column (`Token "'" is invalid`).
+                face_box = json.dumps({
                     "x": float(row["FaceRectX"]),
                     "y": float(row["FaceRectY"]),
                     "w": float(row["FaceRectWidth"]),
