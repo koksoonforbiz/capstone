@@ -754,6 +754,33 @@ export class UserManagementService {
     // Step 3 — atomic cleanup transaction.
     const rowCounts: Record<string, number> = {};
     await this.prisma.$transaction(async (tx) => {
+      // ── Pre-fetch the student's session ids ────────────────────────
+      // We use these as the primary scope for log-table cleanup. In the
+      // wild we've seen rows whose `userId` column drifted out of sync
+      // with the StudentSession.userId they actually belong to (e.g.
+      // session_sync_anchors written during the StrictMode dual-session
+      // bug attributed the anchor to the wrong user). Filtering by
+      // sessionId catches those; filtering only by userId would miss
+      // them and the FK cascade on user.delete() would fail.
+      const userSessions = await tx.studentSession.findMany({
+        where: { userId: studentId },
+        select: { id: true },
+      });
+      const sessionIds = userSessions.map((s) => s.id);
+
+      // Helper: where-clause that catches rows owned by either this
+      // user or this user's sessions. Uses OR rather than two passes so
+      // it works on tables with composite uniqueness.
+      const userOrSession = (userField: 'userId' | 'studentId' = 'userId') =>
+        sessionIds.length > 0
+          ? {
+              OR: [
+                { [userField]: studentId } as Record<string, string>,
+                { sessionId: { in: sessionIds } } as Record<string, unknown>,
+              ],
+            }
+          : ({ [userField]: studentId } as Record<string, string>);
+
       // Break the optional FK from LearningIntervention to DialogueSession
       // so we can delete the dialogue sessions next. The interventions
       // themselves cascade-delete from User in step 6.
@@ -775,73 +802,66 @@ export class UserManagementService {
         await tx.studentSourceDocument.deleteMany({ where: { studentId } })
       ).count;
 
-      // session_sync_anchors has @relation to StudentSession with no
-      // onDelete; without this clear, the cascade-delete of
-      // StudentSession from User would fail.
-      rowCounts.sessionSyncAnchors = (
-        await tx.session_sync_anchors.deleteMany({
-          where: { userId: studentId },
-        })
-      ).count;
+      // session_sync_anchors has @relation to StudentSession with NO
+      // onDelete; the cascade on user.delete() would fail unless we
+      // clear it. The FK is on `sessionId`, so we MUST scope by
+      // sessionId — `userId` alone is unreliable here (data in the
+      // wild has stale anchor.userId values that don't match the
+      // session's actual owner).
+      rowCounts.sessionSyncAnchors =
+        sessionIds.length > 0
+          ? (
+              await tx.session_sync_anchors.deleteMany({
+                where: { sessionId: { in: sessionIds } },
+              })
+            ).count
+          : 0;
 
-      // Bare-userId / bare-studentId log tables (no Prisma @relation,
-      // therefore no DB FK, therefore no cascade reaches them). Wipe
-      // by hand so nothing of the student remains.
-      rowCounts.cursorLogs = (
-        await tx.cursor_logs.deleteMany({ where: { userId: studentId } })
-      ).count;
-      rowCounts.clickLogs = (
-        await tx.click_logs.deleteMany({ where: { userId: studentId } })
-      ).count;
-      rowCounts.scrollLogs = (
-        await tx.scroll_logs.deleteMany({ where: { userId: studentId } })
-      ).count;
+      // Bare-userId / bare-studentId log tables. No Prisma @relation,
+      // therefore no DB FK, therefore no cascade reaches them and the
+      // user.delete() won't fail on these. We delete them by
+      // (userId OR sessionId) so we sweep both data attributed to the
+      // user directly AND data attributed to their sessions, even if
+      // the row's own userId column drifted out of sync.
+      rowCounts.cursorLogs = (await tx.cursor_logs.deleteMany({ where: userOrSession() })).count;
+      rowCounts.clickLogs = (await tx.click_logs.deleteMany({ where: userOrSession() })).count;
+      rowCounts.scrollLogs = (await tx.scroll_logs.deleteMany({ where: userOrSession() })).count;
       rowCounts.keystrokeLogs = (
-        await tx.keystroke_logs.deleteMany({ where: { userId: studentId } })
+        await tx.keystroke_logs.deleteMany({ where: userOrSession() })
       ).count;
       rowCounts.visibilityLogs = (
-        await tx.visibility_logs.deleteMany({ where: { userId: studentId } })
+        await tx.visibility_logs.deleteMany({ where: userOrSession() })
       ).count;
       rowCounts.clipboardLogs = (
-        await tx.clipboard_logs.deleteMany({ where: { userId: studentId } })
+        await tx.clipboard_logs.deleteMany({ where: userOrSession() })
       ).count;
       rowCounts.viewportLogs = (
-        await tx.viewport_logs.deleteMany({ where: { userId: studentId } })
+        await tx.viewport_logs.deleteMany({ where: userOrSession() })
       ).count;
       rowCounts.performanceLogs = (
-        await tx.performance_logs.deleteMany({ where: { userId: studentId } })
+        await tx.performance_logs.deleteMany({ where: userOrSession() })
       ).count;
-      rowCounts.errorLogs = (
-        await tx.error_logs.deleteMany({ where: { userId: studentId } })
-      ).count;
+      rowCounts.errorLogs = (await tx.error_logs.deleteMany({ where: userOrSession() })).count;
       rowCounts.derivedEngagement = (
-        await tx.derived_engagement.deleteMany({
-          where: { userId: studentId },
-        })
+        await tx.derived_engagement.deleteMany({ where: userOrSession() })
       ).count;
       rowCounts.derivedCognitiveLoad = (
-        await tx.derived_cognitive_load.deleteMany({
-          where: { userId: studentId },
-        })
+        await tx.derived_cognitive_load.deleteMany({ where: userOrSession() })
       ).count;
       rowCounts.derivedLearningVelocity = (
-        await tx.derived_learning_velocity.deleteMany({
-          where: { userId: studentId },
-        })
+        await tx.derived_learning_velocity.deleteMany({ where: userOrSession() })
       ).count;
       rowCounts.derivedAtRiskFlags = (
-        await tx.derived_at_risk_flags.deleteMany({
-          where: { userId: studentId },
-        })
+        await tx.derived_at_risk_flags.deleteMany({ where: userOrSession() })
       ).count;
-      rowCounts.efDetections = (await tx.efDetection.deleteMany({ where: { studentId } })).count;
+      rowCounts.efDetections = (
+        await tx.efDetection.deleteMany({ where: userOrSession('studentId') })
+      ).count;
       rowCounts.emotionFrames = (
-        await tx.emotionFrame.deleteMany({ where: { userId: studentId } })
+        await tx.emotionFrame.deleteMany({ where: userOrSession() })
       ).count;
       rowCounts.affectiveStateWindows = (
-        await tx.affectiveStateWindow.deleteMany({
-          where: { userId: studentId },
-        })
+        await tx.affectiveStateWindow.deleteMany({ where: userOrSession() })
       ).count;
 
       // Step 6 — drop the User. Cascade deletes everything declared on
