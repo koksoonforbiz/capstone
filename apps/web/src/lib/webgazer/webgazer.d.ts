@@ -11,11 +11,15 @@ declare module 'webgazer' {
     showVideo(show: boolean): WebGazer;
     showFaceOverlay(show: boolean): WebGazer;
     showFaceFeedbackBox(show: boolean): WebGazer;
+    showPredictionPoints(show: boolean): WebGazer;
     saveDataAcrossSessions(save: boolean): WebGazer;
     begin(): Promise<WebGazer>;
     end(): void;
     setGazeListener(callback: (data: GazeData | null, timestamp: number) => void): WebGazer;
     clearData(): void;
+    recordScreenPosition(x: number, y: number, type: string): void;
+    getCurrentPrediction(): Promise<GazeData | null>;
+    getVideoElement(): HTMLVideoElement | undefined;
   }
 
   const webgazer: WebGazer;

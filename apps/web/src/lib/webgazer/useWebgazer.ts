@@ -8,14 +8,12 @@ import { mediaStreamRegistry } from '../biometrics/mediaStreamRegistry';
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function loadWebgazerScript(): Promise<any | null> {
-  // If already loaded globally
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   if ((window as any).webgazer) return Promise.resolve((window as any).webgazer);
 
   return new Promise((resolve) => {
     const existing = document.querySelector('script[data-webgazer]');
     if (existing) {
-      // Script tag exists but may still be loading
       existing.addEventListener('load', () => {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         resolve((window as any).webgazer ?? null);
@@ -25,7 +23,7 @@ function loadWebgazerScript(): Promise<any | null> {
     }
 
     const script = document.createElement('script');
-    script.src = '/webgazer.js'; // Served from apps/web/public/webgazer.js
+    script.src = '/webgazer.js';
     script.setAttribute('data-webgazer', 'true');
     script.async = true;
     script.onload = () => {
@@ -60,6 +58,7 @@ export function useWebgazer(
   isActive: boolean;
   isCalibrating: boolean;
   needsCalibration: boolean;
+  faceDetected: boolean;
   triggerCalibration: () => void;
   completeCalibration: () => void;
   skipCalibration: () => void;
@@ -71,6 +70,7 @@ export function useWebgazer(
   const [isActive, setIsActive] = useState(false);
   const [isCalibrating, setIsCalibrating] = useState(false);
   const [needsCalibration, setNeedsCalibration] = useState(false);
+  const [faceDetected, setFaceDetected] = useState(false);
   const [latestGaze, setLatestGaze] = useState<{ x: number; y: number } | null>(null);
   const [config, setConfig] = useState<WebgazerConfig | null>(null);
 
@@ -106,7 +106,7 @@ export function useWebgazer(
       () => {
         setNeedsCalibration(true);
       },
-      (config?.inactivityTimeoutSecs ?? 1800) * 1000,
+      (config?.inactivityTimeoutSecs ?? 300) * 1000,
     );
   }, [config]);
 
@@ -125,7 +125,6 @@ export function useWebgazer(
     setNeedsCalibration(false);
   }, []);
 
-  /** Feed a known screen position into WebGazer's regression model. */
   const trainOnPoint = useCallback((screenX: number, screenY: number) => {
     try {
       webgazerRef.current?.recordScreenPosition(screenX, screenY, 'click');
@@ -134,7 +133,6 @@ export function useWebgazer(
     }
   }, []);
 
-  /** Get WebGazer's current gaze prediction (for accuracy testing). */
   const getCurrentPrediction = useCallback(
     (): Promise<{ x: number; y: number } | null> =>
       new Promise((resolve) => {
@@ -163,55 +161,61 @@ export function useWebgazer(
         if (!cfg.isEnabled || cancelled) return;
         setConfig(cfg);
 
-        // Dynamically load WebGazer via script tag (not available as npm package)
         const loadedWg = await loadWebgazerScript();
         if (!loadedWg || cancelled) return;
         webgazerRef.current = loadedWg;
 
         const wg = webgazerRef.current;
-        wg.setRegression('ridge');
-        wg.saveDataAcrossSessions(false);
 
-        // Show WebGazer's internal video + face overlay (needed for face tracking)
-        // but hide them from the main UI — the preview window reads them
-        wg.showVideo(true);
-        wg.showFaceOverlay(true);
-        wg.showFaceFeedbackBox(true);
+        // Initialize WebGazer following the reference implementation:
+        // Chain all config calls BEFORE .begin(), use 'TFFacemesh' tracker
+        await wg
+          .setRegression('ridge')
+          .setTracker('TFFacemesh')
+          .showVideo(false)
+          .showFaceOverlay(false)
+          .showFaceFeedbackBox(false)
+          .saveDataAcrossSessions(false)
+          .begin();
 
-        await wg.begin();
         if (cancelled) {
           wg.end();
           return;
         }
 
-        // Hide WebGazer's default UI elements via a persistent CSS rule
-        // (the underlying face detection still runs for our preview window)
-        if (!document.getElementById('webgazer-hide-style')) {
-          const style = document.createElement('style');
-          style.id = 'webgazer-hide-style';
-          style.textContent = `
-            #webgazerVideoContainer { display: none !important; }
-            #webgazerGazeDot { display: none !important; }
-          `;
-          document.head.appendChild(style);
-        }
+        // Force-hide any WebGazer DOM elements it may have created
+        wg.showVideo(false);
 
-        // Register WebGazer's video stream in the shared registry
-        // so the preview window can display it
+        console.log('[WebGazer] Initialized successfully');
+
+        // Try to register WebGazer's internal video stream for the preview window
         try {
-          const videoEl = wg.getVideoElement?.() as HTMLVideoElement | undefined;
-          const stream = videoEl?.srcObject as MediaStream | null;
+          const videoFeed = document.getElementById('webgazerVideoFeed') as HTMLVideoElement | null;
+          const stream = videoFeed?.srcObject as MediaStream | null;
           if (stream) {
             mediaStreamRegistry.register('webgazer', stream);
+            console.log('[WebGazer] Registered video stream');
           }
         } catch {
-          // getVideoElement may not exist in all WebGazer builds
+          // Video element may not exist
         }
 
-        // Gaze listener throttled to 5 Hz (200ms)
+        // Remove WebGazer's video container from the DOM entirely
+        const wgContainer = document.getElementById('webgazerVideoContainer');
+        if (wgContainer) wgContainer.remove();
+        const wgGazeDot = document.getElementById('webgazerGazeDot');
+        if (wgGazeDot) wgGazeDot.remove();
+
+        // Gaze listener: data=null means no face detected
         wg.setGazeListener(
           (data: { x: number; y: number; confidence?: number } | null, _timestamp: number) => {
-            if (!data) return;
+            if (!data) {
+              setFaceDetected(false);
+              return;
+            }
+
+            setFaceDetected(true);
+
             const now = performance.now();
             if (now - lastGazeTimeRef.current < 200) return;
             lastGazeTimeRef.current = now;
@@ -225,7 +229,6 @@ export function useWebgazer(
               pageUrl: window.location.pathname,
             });
 
-            // Auto-flush at 300 entries
             if (bufferRef.current.length >= 300) {
               flushBuffer();
             }
@@ -235,16 +238,13 @@ export function useWebgazer(
         setIsActive(true);
         console.log('[WebGazer] Active, calibrationOnNewSession:', cfg.calibrationOnNewSession);
 
-        // If calibration on new session, prompt calibration
         if (cfg.calibrationOnNewSession) {
           console.log('[WebGazer] Triggering calibration for new session');
           setNeedsCalibration(true);
         }
 
-        // Flush every 30 seconds
         flushIntervalRef.current = setInterval(flushBuffer, 30000);
 
-        // Inactivity detection
         const resetTimer = () => resetInactivityTimer();
         for (const event of ['mousemove', 'keydown', 'scroll', 'click']) {
           document.addEventListener(event, resetTimer);
@@ -274,7 +274,7 @@ export function useWebgazer(
     };
   }, [courseId, sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Clean up WebGazer on logout
+  // Clean up on logout
   useEffect(() => {
     const handleLogout = () => {
       if (flushIntervalRef.current) clearInterval(flushIntervalRef.current);
@@ -313,6 +313,7 @@ export function useWebgazer(
     isActive,
     isCalibrating,
     needsCalibration,
+    faceDetected,
     triggerCalibration,
     completeCalibration,
     skipCalibration,
